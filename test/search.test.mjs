@@ -6,7 +6,6 @@ import assert from "node:assert/strict";
 
 import {
   runSearch,
-  performSearch,
   formatSearchResults,
   buildSearchStructured,
   dedupeSearchResults,
@@ -131,7 +130,8 @@ test("search: source_profile presets supply language and domain defaults", () =>
 test("search: an empty result set returns actionable suggestions instead of silence", async () => {
   const stub = searchStub('{"results":[]}');
   try {
-    const text = await performSearch({ query: "짧은질의", auto_source_profile: false }, "pplx-test");
+    const search = await runSearch({ query: "짧은질의", auto_source_profile: false }, "pplx-test");
+    const text = formatSearchResults(search, {});
     assert.match(text, /No search results found/);
     assert.match(text, /Try next:/);
   } finally {

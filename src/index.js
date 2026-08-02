@@ -1299,6 +1299,58 @@ function isNewsRedirectSinkUrl(url, baseUrl = "") {
   return false;
 }
 
+// Never delete the containers an article body normally lives in.
+const ARTICLE_CONTAINER_TAGS = ["article", "main", "body"];
+// Tag names that are chrome regardless of their attributes (news pages only).
+const NEWS_NOISE_TAGS_RE = /^(aside|nav|footer|header|figure|figcaption)$/i;
+// Elements that never contribute text and can go before any attribute analysis.
+const BOILERPLATE_INERT_TAGS_RE = /<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi;
+// Defensive stop only; real pages never approach it.
+const BOILERPLATE_MAX_REMOVALS = 5000;
+
+// MediaWiki, SAGE and news pages all need the same operation: walk the markup
+// and delete whole elements whose id/class/role marks them as chrome. The three
+// call sites differ only in which attribute pattern counts as noise, which
+// container tags must never be deleted, and whether some tag names are noise on
+// their own.
+//
+// Scanning moves strictly forward. An earlier version restarted from index 0
+// after every removal and gave up after 80-100 passes, so a page carrying more
+// boilerplate than that kept the remainder in its extracted body.
+/**
+ * @param {string} html
+ * @param {{ attrPattern: RegExp, keepTags?: string[], noiseTagPattern?: RegExp|null, includeAriaLabel?: boolean }} options
+ */
+function stripBoilerplateElements(html, { attrPattern, keepTags = [], noiseTagPattern = null, includeAriaLabel = false }) {
+  let out = String(html || "")
+    .replace(BOILERPLATE_INERT_TAGS_RE, "")
+    .replace(/<input\b[^>]*>/gi, "");
+
+  const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
+  let removals = 0;
+  let match;
+  while ((match = openTagRe.exec(out)) && removals < BOILERPLATE_MAX_REMOVALS) {
+    const tagName = match[1].toLowerCase();
+    if (keepTags.includes(tagName)) continue;
+
+    const attrs = parseAttributes(match[2]);
+    const attrText = [attrs.id, attrs.class, attrs.role, includeAriaLabel ? attrs["aria-label"] : ""]
+      .map((value) => value || "")
+      .join(" ");
+    const tagIsNoise = !!noiseTagPattern && noiseTagPattern.test(tagName);
+    if (!tagIsNoise && !attrPattern.test(attrText)) continue;
+
+    const element = extractElementFromOpenTag(out, match.index, tagName);
+    if (!element.length) continue; // malformed markup; never risk a stuck loop
+    out = out.slice(0, match.index) + out.slice(match.index + element.length);
+    // Everything before match.index is unchanged and already scanned, so resume
+    // exactly where the removed element used to start.
+    openTagRe.lastIndex = match.index;
+    removals++;
+  }
+  return out;
+}
+
 function findElementByClass(html, className) {
   const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
   let match;
@@ -1963,33 +2015,11 @@ function extractNamuWikiData(url, html, mode = "balanced", opts = {}) {
 const MEDIAWIKI_BOILERPLATE_ATTR_RE = /(?:^|[\s_-])(mw-editsection|toc|catlinks|printfooter|navbox|metadata|ambox|headAlert|noprint|thumb|tright|tleft|floatright|floatleft|gallery)(?:$|[\s_-])/i;
 
 function stripMediaWikiBoilerplateHtml(html) {
-  // No regex shortcut for mw-editsection here: MediaWiki nests bracket spans
-  // inside it (`<span class=mw-editsection><span>[</span><a><span>edit</span>…`),
-  // so a non-greedy `[\s\S]*?</span>` stops at the first inner close tag and
-  // leaves an orphaned "edit" in the body. The depth-aware guard loop below
-  // already matches mw-editsection and removes the whole element.
-  let out = String(html || "")
-    .replace(/<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi, "")
-    .replace(/<input\b[^>]*>/gi, "");
-
-  let guard = 0;
-  while (guard++ < 80) {
-    const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
-    let match;
-    let changed = false;
-    while ((match = openTagRe.exec(out))) {
-      const tagName = match[1].toLowerCase();
-      const attrs = parseAttributes(match[2]);
-      const attrText = `${attrs.id || ""} ${attrs.class || ""} ${attrs.role || ""}`;
-      if (!MEDIAWIKI_BOILERPLATE_ATTR_RE.test(attrText)) continue;
-      const element = extractElementFromOpenTag(out, match.index, tagName);
-      out = out.slice(0, match.index) + out.slice(match.index + element.length);
-      changed = true;
-      break;
-    }
-    if (!changed) break;
-  }
-  return out;
+  // No regex shortcut for mw-editsection: MediaWiki nests bracket spans inside
+  // it (`<span class=mw-editsection><span>[</span><a><span>edit</span>…`), so a
+  // non-greedy `[sS]*?</span>` stops at the first inner close tag and leaves an
+  // orphaned "edit" beside every heading. Depth-aware removal handles it.
+  return stripBoilerplateElements(html, { attrPattern: MEDIAWIKI_BOILERPLATE_ATTR_RE });
 }
 
 // Table-of-contents heading, in the languages the registry actually covers.
@@ -2072,29 +2102,11 @@ const SAGE_BODY_ATTR_RE = /(hlFld[-_\s]?(Abstract|Fulltext|FullText)|article[-_\
 const SAGE_BOILERPLATE_ATTR_RE = /(?:^|[\s_-])(access|alert|article-tools|author-information|banner|breadcrumb|collection|cookie|download|figures|footer|header|issue-item|metrics|modal|navbar|permissions|popup|recommended|related|rights|share|sidebar|social|table-of-contents|toc|toolbar)(?:$|[\s_-])/i;
 
 function stripSageBoilerplateHtml(html) {
-  let out = String(html || "")
-    .replace(/<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi, "")
-    .replace(/<input\b[^>]*>/gi, "");
-
-  let guard = 0;
-  while (guard++ < 100) {
-    const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
-    let match;
-    let changed = false;
-    while ((match = openTagRe.exec(out))) {
-      const tagName = match[1].toLowerCase();
-      if (["article", "main", "body"].includes(tagName)) continue;
-      const attrs = parseAttributes(match[2]);
-      const attrText = `${attrs.id || ""} ${attrs.class || ""} ${attrs.role || ""} ${attrs["aria-label"] || ""}`;
-      if (!SAGE_BOILERPLATE_ATTR_RE.test(attrText)) continue;
-      const element = extractElementFromOpenTag(out, match.index, tagName);
-      out = out.slice(0, match.index) + out.slice(match.index + element.length);
-      changed = true;
-      break;
-    }
-    if (!changed) break;
-  }
-  return out;
+  return stripBoilerplateElements(html, {
+    attrPattern: SAGE_BOILERPLATE_ATTR_RE,
+    keepTags: ARTICLE_CONTAINER_TAGS,
+    includeAriaLabel: true,
+  });
 }
 
 function cleanSageArticleText(text) {
@@ -2585,32 +2597,12 @@ function isNewsBoilerplateLine(line) {
 }
 
 function stripNewsBoilerplateHtml(html) {
-  let out = String(html || "")
-    .replace(/<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi, "")
-    .replace(/<input\b[^>]*>/gi, "");
-
-  let guard = 0;
-  while (guard++ < 80) {
-    const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
-    let match;
-    let changed = false;
-    while ((match = openTagRe.exec(out))) {
-      const tagName = match[1].toLowerCase();
-      if (["article", "main", "body"].includes(tagName)) continue;
-
-      const attrs = parseAttributes(match[2]);
-      const attrText = `${attrs.id || ""} ${attrs.class || ""} ${attrs.role || ""} ${attrs["aria-label"] || ""}`;
-      const tagIsNoise = /^(aside|nav|footer|header|figure|figcaption)$/i.test(tagName);
-      if (!tagIsNoise && !NEWS_BOILERPLATE_ATTR_RE.test(attrText)) continue;
-
-      const element = extractElementFromOpenTag(out, match.index, tagName);
-      out = out.slice(0, match.index) + out.slice(match.index + element.length);
-      changed = true;
-      break;
-    }
-    if (!changed) break;
-  }
-  return out;
+  return stripBoilerplateElements(html, {
+    attrPattern: NEWS_BOILERPLATE_ATTR_RE,
+    keepTags: ARTICLE_CONTAINER_TAGS,
+    noiseTagPattern: NEWS_NOISE_TAGS_RE,
+    includeAriaLabel: true,
+  });
 }
 
 function scoreNewsText(text) {

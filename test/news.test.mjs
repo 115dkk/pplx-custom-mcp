@@ -9,6 +9,7 @@ import {
   extractNewsArticleData,
   cleanNewsText,
   dedupeNewsBodyAgainstTitle,
+  stripNewsBoilerplateHtml,
   findNewsSourceByHost,
   isNewsUrl,
   resolveSitePreset,
@@ -59,6 +60,22 @@ test("news: HTML-only article body is extracted and chrome is stripped", () => {
   assert.doesNotMatch(article.text, /공유하기/, "share widget leaked into the body");
   assert.doesNotMatch(article.text, /관련기사/, "related-article rail leaked into the body");
   assert.doesNotMatch(article.text, /무단전재/, "copyright footer leaked into the body");
+});
+
+test("news: boilerplate removal is not capped part-way through a heavy page", () => {
+  // The stripper used to restart its scan from index 0 after each removal and
+  // bail out after ~80 passes, so an ad-heavy page kept the remainder in its
+  // body. Scanning forward removes every match regardless of count.
+  const html = [
+    '<div class="article-body">',
+    ...Array.from({ length: 150 }, (_, i) => `<div class="ad_wrap">AD${i}</div>`),
+    "<p>실제 기사 본문 문장입니다.</p>",
+    "</div>",
+  ].join("");
+
+  const stripped = stripNewsBoilerplateHtml(html);
+  assert.equal((stripped.match(/AD\d+/g) || []).length, 0, "boilerplate survived past the old removal cap");
+  assert.match(stripped, /실제 기사 본문 문장입니다/, "the body must survive the sweep");
 });
 
 test("news: boilerplate line filter drops chrome but keeps prose", () => {
