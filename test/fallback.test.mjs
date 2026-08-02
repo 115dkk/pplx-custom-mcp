@@ -184,3 +184,28 @@ test("agent: no API key means neither paid fallback is attempted", async () => {
     stub.restore();
   }
 });
+
+test("agent: our own search fallback still runs after a fetch_url timeout", async () => {
+  // fetch_url is an extra step in front of the existing fallback, never a
+  // replacement. A hang, an error, or a refusal must not consume its turn.
+  for (const failure of [
+    { url: AGENT_API, method: "POST", body: () => { throw new Error("Perplexity API timeout (20000 ms)."); } },
+    { url: AGENT_API, method: "POST", status: 500, body: "upstream exploded" },
+    { url: AGENT_API, method: "POST", body: JSON.stringify({ output: [] }), headers: { "content-type": "application/json" } },
+  ]) {
+    const stub = installFetch([
+      failure,
+      { url: API, method: "POST", body: JSON.stringify({ results: [{ title: "나무위키", url: ARTICLE_URL, snippet: "한국어 위키위키 사이트이다." }] }), headers: { "content-type": "application/json" } },
+    ]);
+    const warnings = [];
+    try {
+      const out = await fetchRemoteBody(ARTICLE_URL, 8000, "pplx-test", warnings);
+      assert.ok(out, "the search fallback was skipped after a fetch_url failure");
+      assert.equal(out.source, "perplexity");
+      assert.match(out.text, /한국어 위키위키 사이트이다/);
+      assert.equal(stub.matching("/search").length, 1, "the search fallback should have been attempted exactly once");
+    } finally {
+      stub.restore();
+    }
+  }
+});

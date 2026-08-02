@@ -3112,9 +3112,10 @@ async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
   }
 }
 
-// Both remote fallbacks in priority order: fetch the actual page first, and
-// only search for it if fetching is refused (robots disallow still leaves the
-// page indexed, so search can succeed where fetch_url cannot).
+// Both remote paths, in order. fetch_url is an EXTRA step in front of our own
+// search fallback, never a replacement for it: whatever fetch_url does —
+// refuse, error, or time out — the search fallback still gets its turn, because
+// a robots-disallowed page is usually still indexed and searchable.
 // Returns { text, source } or null.
 async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   if (!apiKey) return null;
@@ -3127,6 +3128,7 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
     warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
   }
 
+  // Always reached, whatever happened above.
   try {
     const searched = await fetchViaPerplexity(url, maxChars, apiKey);
     if (searched) return { text: searched, source: "perplexity" };
@@ -3577,6 +3579,12 @@ function isOpaqueSlug(slug) {
 // so it scales with page size, not with a per-call premium.
 const AGENT_ENDPOINT = "v1/agent";
 const AGENT_PRESET = "fast";
+// Measured 11-15 s per call, but a Worker colo saw one run past 30 s. This is
+// an extra step in front of our own fallback, not a replacement for it, so it
+// gets a bounded slice of the budget and hands over on expiry rather than
+// spending the time that the search fallback still needs.
+const AGENT_FETCH_TIMEOUT_MS = 20_000;
+const SEARCH_FALLBACK_TIMEOUT_MS = 20_000;
 // The tool reports failure as a sentence inside the snippet, not as an error.
 const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
 
@@ -3587,7 +3595,7 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
     // result, so nothing is gained by having the model repeat it back.
     input: `Fetch ${url}. Reply with OK.`,
     tools: [{ type: "fetch_url", max_urls: 1 }],
-  }, apiKey);
+  }, apiKey, AGENT_FETCH_TIMEOUT_MS);
   const data = await response.json();
 
   const item = (Array.isArray(data?.output) ? data.output : []).find((o) => o?.type === "fetch_url_results");
@@ -3658,7 +3666,7 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
         max_results: 5,
         max_tokens_per_page: 2048,
         search_domain_filter: [host],
-      }, apiKey);
+      }, apiKey, SEARCH_FALLBACK_TIMEOUT_MS);
       const data = await response.json();
       const results = Array.isArray(data?.results) ? data.results : [];
       // Only the requested document will do. A near-miss on the same domain is
@@ -3702,9 +3710,9 @@ function paginateText(text, pageSize, requestedPage) {
 
 // ── Perplexity /search ──────────────────────────────────────────────
 
-async function makeApiRequest(endpoint, body, apiKey) {
+async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PERPLEXITY_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
       method: "POST",
@@ -3724,7 +3732,7 @@ async function makeApiRequest(endpoint, body, apiKey) {
     return res;
   } catch (err) {
     if (err && err.name === "AbortError") {
-      throw new Error(`Perplexity API timeout (${PERPLEXITY_TIMEOUT_MS} ms).`);
+      throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
     }
     throw err;
   } finally {
