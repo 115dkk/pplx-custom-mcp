@@ -1,24 +1,44 @@
 {
-  "//": "Targets for the live smoke run (scripts/live-smoke.mjs). These hit the real internet through the deployed Worker, so they catch site redesigns that fixture tests cannot. Only long-lived URLs belong here — forum posts and news articles rot within weeks. Add a current DCinside post under `optional` when you want to verify comment loading against the live site; a missing/blank entry is skipped, not failed.",
+  "//": "Targets for the live smoke run (scripts/live-smoke.mjs). These go through the DEPLOYED Worker to the real internet, so they catch site changes that fixture tests cannot. Only long-lived URLs belong here — forum posts and news articles rot within weeks.",
+  "//expect_source": "Which fetch path must serve the page, read from the `source:` header line. `direct` means plain HTTP worked. `perplexity` means every direct attempt was blocked and the paid site: fallback (~$0.005/call) stood in. Listing both accepts either, so a target that starts working directly does not fail the run.",
+  "//blocked": "Verified 2026-08-02 from Cloudflare Worker egress: namu.wiki and sourceforge.net (including its Allura REST endpoint) answer 403 to every UA. Their entries therefore expect the Perplexity fallback, not a direct fetch.",
   "targets": [
     {
       "name": "steam store page",
       "url": "https://store.steampowered.com/app/440/",
       "min_body_chars": 400,
+      "expect_source": ["direct"],
       "must_contain": ["Team Fortress"]
     },
     {
-      "name": "namuwiki article",
-      "url": "https://namu.wiki/w/나무위키",
+      "name": "github repository page",
+      "url": "https://github.com/cloudflare/workers-sdk",
       "min_body_chars": 800,
+      "expect_source": ["direct"],
+      "must_contain": ["workers-sdk"]
+    },
+    {
+      "name": "generic documentation page",
+      "url": "https://developers.cloudflare.com/workers/",
+      "min_body_chars": 800,
+      "expect_source": ["direct"],
+      "must_contain": []
+    },
+    {
+      "name": "namuwiki via blocked-site fallback",
+      "url": "https://namu.wiki/w/나무위키",
+      "min_body_chars": 300,
+      "expect_source": ["direct", "perplexity"],
       "must_contain": []
     }
   ],
+  "//optional": "Entries with a blank url are skipped, not failed. Paste a current DCinside post here when you want to verify comment loading against the live site.",
   "optional": [
     {
       "name": "dcinside post with comments",
       "url": "",
       "min_body_chars": 50,
+      "expect_source": ["direct"],
       "must_contain": ["## 댓글"]
     }
   ]

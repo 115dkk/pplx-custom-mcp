@@ -60,12 +60,20 @@ for (const target of targets) {
     });
     const text = (result.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
     const body = text.split("\n\n").slice(1).join("\n\n");
+    const source = text.match(/^HTTP: .*?source: (\S+)/m)?.[1] || "unknown";
 
     check(
       body.length >= target.min_body_chars,
       `${target.name}: body length`,
-      `${body.length} chars (need ${target.min_body_chars})`
+      `${body.length} chars (need ${target.min_body_chars}), source=${source}`
     );
+    if (target.expect_source?.length) {
+      check(
+        target.expect_source.includes(source),
+        `${target.name}: fetch path`,
+        `served by ${source}, expected one of ${target.expect_source.join("/")}`
+      );
+    }
     for (const needle of target.must_contain || []) {
       check(text.includes(needle), `${target.name}: contains ${JSON.stringify(needle)}`);
     }
