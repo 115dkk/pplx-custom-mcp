@@ -3506,6 +3506,46 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
 // Perplexity-mediated fetch: site:domain + slug keywords with high max_tokens_per_page.
 // Used as the final fallback when direct fetch fails on Cloudflare-protected SPAs.
 // Tries narrowest query first (slug only), then progressively broader.
+// The Perplexity fallback searches for the page instead of fetching it, so the
+// result is only usable if it is the SAME document. Without this check a URL
+// whose slug carries no meaning — namu.wiki/thread/FunnySulkySpuriousGate —
+// returns whatever ranks first on that domain, presented as the requested page.
+function sameDocument(requestedUrl, candidateUrl) {
+  if (!candidateUrl) return false;
+  try {
+    const a = new URL(requestedUrl);
+    const b = new URL(candidateUrl);
+    // Accept language variants of the same site (en.namu.wiki vs namu.wiki).
+    const registrable = (host) => host.replace(/^www\./, "").split(".").slice(-2).join(".");
+    if (registrable(a.hostname) !== registrable(b.hostname)) return false;
+
+    const path = (u) => decodeURIComponent(u.pathname).replace(/\/+$/, "").toLowerCase();
+    if (path(a) !== path(b)) return false;
+
+    // When the identity lives in the query string, it has to survive too.
+    for (const [key, value] of a.searchParams) {
+      if (b.searchParams.get(key) !== value) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Opaque identifiers (thread tokens, hashes, UUIDs) carry no searchable meaning,
+// so a keyword search built from them can only return an unrelated page. Skip
+// the paid call rather than pay for a result that will be rejected anyway.
+function isOpaqueSlug(slug) {
+  const token = String(slug || "").trim();
+  if (token.includes(" ") || token.length < 12) return false;
+  return (
+    /^(?:[A-Z][a-z]{2,}){3,}$/.test(token) ||        // FunnySulkySpuriousGate
+    /^[0-9a-f]{16,}$/i.test(token) ||                 // hex digest
+    /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(token) ||       // uuid
+    (/^[A-Za-z0-9_-]{16,}$/.test(token) && /[a-z]/.test(token) && /[A-Z0-9]/.test(token))
+  );
+}
+
 async function fetchViaPerplexity(url, maxChars, apiKey) {
   let host, segments;
   try {
@@ -3529,10 +3569,13 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
   const candidates = [];
   for (let i = segments.length - 1; i >= 0; i--) {
     const slug = slugify(segments[i]);
-    if (slug.length >= 3) {
-      candidates.push(slug);
-      if (candidates.length >= 2) break;  // try at most 2 narrowing levels
-    }
+    if (slug.length < 3) continue;
+    // The deepest meaningful segment is what identifies the document. If that
+    // is an opaque id, no broader segment can stand in for it — "thread" would
+    // just search the route name — so the page is simply not searchable.
+    if (candidates.length === 0 && isOpaqueSlug(slug)) return null;
+    candidates.push(slug);
+    if (candidates.length >= 2) break;  // try at most 2 narrowing levels
   }
   // Fallback to all path segments concatenated.
   if (candidates.length === 0) {
@@ -3541,18 +3584,23 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
 
   for (const keywords of candidates) {
     const query = keywords.slice(0, 200).trim();
-    if (!query) continue;
+    if (!query || isOpaqueSlug(query)) continue;
     try {
       // Use official search_domain_filter (allowlist for the host) instead of `site:` query operator.
+      // Ask for several results: the requested document is not always ranked first.
       const response = await makeApiRequest("search", {
         query,
-        max_results: 1,
+        max_results: 5,
         max_tokens_per_page: 2048,
         search_domain_filter: [host],
       }, apiKey);
       const data = await response.json();
-      const r = data?.results?.[0];
-      if (r && (r.snippet || r.title)) {
+      const results = Array.isArray(data?.results) ? data.results : [];
+      // Only the requested document will do. A near-miss on the same domain is
+      // still the wrong page, and returning it would be worse than returning
+      // nothing, because the caller has no way to tell.
+      const r = results.find((item) => sameDocument(url, item?.url) && (item.snippet || item.title));
+      if (r) {
         const parts = [
           r.title ? `# ${cleanText(r.title)}` : "",
           `URL (Perplexity-mediated): ${r.url || url}`,
@@ -4486,6 +4534,9 @@ export {
   fetchDcinsideComments,
   fetchSourceForgeAllura,
   fetchSageViaPmc,
+  fetchViaPerplexity,
+  sameDocument,
+  isOpaqueSlug,
   runSearch,
   performSearch,
   makeApiRequest,
