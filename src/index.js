@@ -4107,6 +4107,36 @@ function validateSearchArgs(args) {
   return "";
 }
 
+// Four tool schemas share the same fetch and search knobs. Normalising the
+// defaults in one place each keeps them from drifting apart — previously the
+// same three `?? "balanced"` / `?? "auto"` / `!== false` lines were copied into
+// every handler.
+function normalizeFetchOpts(args, overrides = {}) {
+  return {
+    ...args,
+    cleaning_mode: args.cleaning_mode ?? "balanced",
+    site_preset: args.site_preset ?? "auto",
+    include_links: args.include_links !== false,
+    ...overrides,
+  };
+}
+
+function normalizeSearchOpts(args, overrides = {}) {
+  return {
+    ...args,
+    max_results: args.max_results ?? 10,
+    max_tokens_per_page: args.max_tokens_per_page ?? 256,
+    source_profile: args.source_profile ?? "general",
+    ...overrides,
+  };
+}
+
+function toolError(message) {
+  /** @type {Array<import("@modelcontextprotocol/sdk/types.js").ContentBlock>} */
+  const content = [{ type: "text", text: `Error: ${message}` }];
+  return { content, isError: true };
+}
+
 function createServer(apiKey) {
   const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
 
@@ -4118,20 +4148,10 @@ function createServer(apiKey) {
       outputSchema: SEARCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      // Apply defaults.
-      const opts = {
-        ...args,
-        max_results: args.max_results ?? 10,
-        max_tokens_per_page: args.max_tokens_per_page ?? 256,
-        source_profile: args.source_profile ?? "general",
-      };
+      const opts = normalizeSearchOpts(args);
       const validationError = validateSearchArgs(opts);
-      if (validationError) {
-        return {
-          content: [{ type: "text", text: `Error: ${validationError}` }],
-          isError: true,
-        };
-      }
+      if (validationError) return toolError(validationError);
+
       const search = await runSearch(opts, apiKey);
       const text = formatSearchResults(search, { debug: opts.debug });
       const structuredContent = buildSearchStructured(search, text);
@@ -4147,12 +4167,7 @@ function createServer(apiKey) {
       outputSchema: FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      const opts = {
-        ...args,
-        cleaning_mode: args.cleaning_mode ?? "balanced",
-        site_preset: args.site_preset ?? "auto",
-        include_links: args.include_links !== false,
-      };
+      const opts = normalizeFetchOpts(args);
       const { result, text, imageContent } = await fetchAndFormat(args.url, apiKey, opts);
       const structuredContent = buildFetchStructured(args.url, result, text, opts);
       // Text first, then any image blocks collected for multimodal clients.
@@ -4176,13 +4191,7 @@ function createServer(apiKey) {
       for (let i = 0; i < args.urls.length; i++) {
         const url = args.urls[i];
         try {
-          const opts = {
-            ...args,
-            max_chars: args.max_chars ?? 4000,
-            cleaning_mode: args.cleaning_mode ?? "balanced",
-            site_preset: args.site_preset ?? "auto",
-            include_links: args.include_links !== false,
-          };
+          const opts = normalizeFetchOpts(args, { max_chars: args.max_chars ?? 4000 });
           const { result, text } = await fetchAndFormat(url, apiKey, opts);
           parts.push(`## [${i + 1}] ${url}\n\n${text}`);
           items.push(buildFetchStructured(url, result, text, opts).result);
@@ -4212,19 +4221,11 @@ function createServer(apiKey) {
       outputSchema: SEARCH_FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      const opts = {
-        ...args,
+      const opts = normalizeSearchOpts(args, {
         max_results: args.max_results ?? Math.max(8, args.fetch_top_k ?? 3),
-        max_tokens_per_page: args.max_tokens_per_page ?? 256,
-        source_profile: args.source_profile ?? "general",
-      };
+      });
       const validationError = validateSearchArgs(opts);
-      if (validationError) {
-        return {
-          content: [{ type: "text", text: `Error: ${validationError}` }],
-          isError: true,
-        };
-      }
+      if (validationError) return toolError(validationError);
 
       const search = await runSearch(opts, apiKey);
       const topK = Math.min(args.fetch_top_k ?? 3, SEARCH_FETCH_TOP_K_LIMIT, search.results.length);
@@ -4238,16 +4239,18 @@ function createServer(apiKey) {
       for (let i = 0; i < topK; i++) {
         const result = search.results[i];
         try {
-          const fetchOpts = {
+          // Explicit allowlist, not a spread: search arguments such as query
+          // and fetch_top_k must not leak into the fetch options.
+          const fetchOpts = normalizeFetchOpts({
             max_chars: args.fetch_chars ?? 3500,
             page: 1,
-            cleaning_mode: args.cleaning_mode ?? "balanced",
-            site_preset: args.site_preset ?? "auto",
+            cleaning_mode: args.cleaning_mode,
+            site_preset: args.site_preset,
             metadata_only: args.metadata_only,
-            include_links: args.include_links !== false,
+            include_links: args.include_links,
             debug: args.debug,
             use_cache: args.use_cache,
-          };
+          });
           const fetched = await fetchAndFormat(result.url, apiKey, fetchOpts);
           chunks.push(`\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`);
           fetchedItems.push(buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result);
