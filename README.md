@@ -18,7 +18,7 @@ JS로 렌더링되는 콘텐츠를 헤드리스 브라우저로 뜯는 대신, *
 
 ---
 
-## 도구 (v1.2.0)
+## 도구 (v1.2.1)
 
 네 개 모두 `outputSchema`를 선언하고 사람이 읽는 텍스트와 `structuredContent`를 함께 돌려줍니다.
 
@@ -36,14 +36,15 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 
 - `url`(필수), `max_chars`(기본 8000, 상한 32000), `page`(기본 1), `cleaning_mode`(`strict`/`balanced`/`raw-ish`)
 - `site_preset`: `auto`가 URL로 사이트를 판별. `none`이면 사이트별 처리를 끔
-- `metadata_only`(선별용), `include_links`(기본 켜짐), `include_comments`(기본 켜짐), `include_images`/`max_images`, `use_cache`/`cache_ttl_seconds`, `debug`
+- `metadata_only`(선별용), `include_links`(기본 켜짐), `include_comments`(기본 켜짐), `include_images`/`max_images`(기본 2), `use_cache`/`cache_ttl_seconds`, `debug`
+- 디시인사이드 글은 본문 이미지가 자동 첨부됩니다. 다른 사이트는 이미지·스크린샷·차트 등 시각 정보가 필요할 때 `include_images=true`를 사용합니다. 성공한 이미지는 MCP 이미지 블록과 출처 URL/구조화 메타데이터를 함께 반환하므로 이미지 블록을 표시하지 않는 클라이언트에서도 원본 링크가 남습니다.
 - 본문이 `max_chars`를 넘으면 같은 `url`/`max_chars`에 `page+1`로 다시 호출
 
 사이트별 처리:
 
 | 사이트 | 하는 일 |
 |---|---|
-| DCinside | 모바일 URL 변환, `dcinside.app` UA, 로그인·광고 리다이렉트 싱크 차단, 댓글 XHR 재현 |
+| DCinside | 모바일 URL 변환, `dcinside.app` UA, 로그인·광고 리다이렉트 싱크 차단, 댓글 XHR 재현, 본문 이미지 자동 첨부 |
 | Reddit | HTML이 봇 검증에 걸리면 공개 `.json?raw_json=1`로 폴백, 본문+댓글 트리 추출 |
 | 나무위키 | VPN/IDC 공지, `[편집]` 마커, 분류·네비게이션 상자, 목차 제거 |
 | MediaWiki | `mw-content-text` 추출, 목차·편집 링크·알림 상자·썸네일 캡션 제거 |

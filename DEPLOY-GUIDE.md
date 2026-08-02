@@ -47,7 +47,7 @@ curl -X POST https://perplexity-mcp.<계정명>.workers.dev/mcp \
 
 1. Claude.ai → Settings → Connectors → Add custom connector
 2. URL 입력: `https://perplexity-mcp.<계정명>.workers.dev/mcp`
-3. 연결 후 대화에서 아래 도구가 노출되는지 확인 (v1.1.0 기준):
+3. 연결 후 대화에서 아래 도구가 노출되는지 확인 (v1.2.1 기준):
    - perplexity_search — 비공식 웹 검색 (제목·URL·스니펫 미리보기)
    - perplexity_fetch — URL 본문 직접 추출 + 잡음 정제
    - perplexity_fetch_many — 여러 URL 본문 일괄 추출
@@ -56,13 +56,40 @@ curl -X POST https://perplexity-mcp.<계정명>.workers.dev/mcp \
 
 ---
 
+## 6단계: ChatGPT Work 개인 플러그인 등록
+
+ChatGPT 웹은 Codex의 로컬 MCP 설정을 읽지 않습니다. 대신 원격 MCP를 개인 플러그인으로 연결할 수 있습니다.
+
+1. ChatGPT → Settings → Security and login → Developer mode 켜기
+2. [ChatGPT Plugins](https://chatgpt.com/plugins)에서 `+` 선택
+3. MCP 서버 URL에 `https://perplexity-mcp.<계정명>.workers.dev/mcp` 입력 후 개인 플러그인 생성
+4. [Personal plugins](https://chatgpt.com/plugins?view=personal)에서 생성한 플러그인 설치
+5. ChatGPT 홈에서 **Chat**이 아니라 **Work** 탭을 열고, 입력창에서 `@`로 플러그인을 선택해 호출
+
+공식 절차: [OpenAI Plugins quickstart](https://developers.openai.com/plugins/quickstart)
+
+---
+
+## 7단계: Codex에 직접 등록
+
+```bash
+codex mcp add perplexity --url https://perplexity-mcp.<계정명>.workers.dev/mcp
+codex mcp get perplexity
+```
+
+Codex 앱·CLI·IDE 확장은 같은 MCP 설정을 공유합니다. 등록 후 클라이언트를 재시작하고 `/mcp`에서 `perplexity`가 활성화됐는지 확인합니다.
+
+공식 절차: [OpenAI MCP configuration](https://learn.chatgpt.com/docs/extend/mcp)
+
+---
+
 ## 아키텍처 참고
 
 - **Stateless**: `createMcpHandler` 사용 (Durable Object 불필요, 무료 티어 호환)
 - **MCP SDK ≥1.26.0 호환**: 요청마다 새 McpServer 인스턴스 생성
-- **4개 도구** (v1.2.0):
+- **4개 도구** (v1.2.1):
   - `perplexity_search` — Perplexity `/search` 호출, source_profile/dedupe/date signals 지원, ~$0.005/회
-  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션. 직접 경로가 막히면 Perplexity `fetch_url`, 이어서 동일 문서 검증 검색 폴백 사용
+  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션. 직접 경로가 막히면 Perplexity `fetch_url`, 이어서 동일 문서 검증 검색 폴백 사용. 디시 글은 본문 이미지를 자동 첨부하고, 다른 사이트는 `include_images=true`로 이미지 블록과 출처 URL을 함께 반환
   - `perplexity_fetch_many` — 여러 URL을 하나의 evidence pack으로 fetch
   - `perplexity_search_fetch` — 검색 + dedupe + 상위 K개 fetch 원샷 워크플로
   - 모든 도구는 `outputSchema`와 `structuredContent`를 제공

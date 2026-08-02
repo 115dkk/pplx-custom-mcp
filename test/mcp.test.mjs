@@ -15,6 +15,8 @@ const ARTICLE_URL = "https://example.com/blog/no-headless";
 const ARTICLE_HTML = fixture("generic-article.html");
 const SEARCH_JSON = fixture("perplexity-search.json");
 const DC_URL = "https://gall.dcinside.com/board/view/?id=programming&no=1234567";
+const DC_IMAGE_URL = "https://dcimg4.dcinside.co.kr/viewimage.php?id=programming&no=1234567&file=post.png";
+const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
 const EXPECTED_TOOLS = ["perplexity_search", "perplexity_fetch", "perplexity_fetch_many", "perplexity_search_fetch"];
 
@@ -45,6 +47,7 @@ test("mcp: all four tools are advertised with input and output schemas", async (
 
     const fetchTool = tools.find((t) => t.name === "perplexity_fetch");
     assert.ok(fetchTool.inputSchema.required.includes("url"));
+    assert.match(fetchTool.inputSchema.properties.include_images.description, /Automatically enabled for DCinside/);
     const manyTool = tools.find((t) => t.name === "perplexity_fetch_many");
     assert.ok(manyTool.inputSchema.required.includes("urls"));
   } finally {
@@ -100,6 +103,38 @@ test("mcp: perplexity_fetch on DCinside returns body and comments together", asy
     assert.match(text, /무료 티어로도 충분히 돌아간다/, "본문 missing from the tool response");
     assert.match(text, /## 댓글 \(4\)/, "댓글 missing from the tool response");
     assert.equal(result.structuredContent.result.structured_data.comment_count, 4);
+  } finally {
+    await close();
+    stub.restore();
+  }
+});
+
+test("mcp: DCinside content images attach automatically with source metadata", async () => {
+  const page = fixture("dcinside-view.html").replace(
+    '<div class="write_div">',
+    `<div class="write_div"><img src="/blank.gif" data-original="${DC_IMAGE_URL}">`
+  );
+  const stub = installFetch([
+    { url: DC_IMAGE_URL, body: PNG_1X1, headers: { "content-type": "application/octet-stream" } },
+    { url: "https://gall.dcinside.com/board/view/", body: page },
+  ]);
+  const { client, close } = await connect();
+  try {
+    const result = await client.callTool({
+      name: "perplexity_fetch",
+      arguments: { url: DC_URL, include_comments: false, use_cache: false },
+    });
+    assert.notEqual(result.isError, true, textOf(result));
+    const images = (result.content || []).filter((block) => block.type === "image");
+    assert.equal(images.length, 1, "auto image mode did not return an MCP image block");
+    assert.equal(images[0].mimeType, "image/png");
+    assert.ok(images[0].data.length > 20, "image base64 is empty");
+    assert.deepEqual(result.structuredContent.result.images, [{
+      url: DC_IMAGE_URL,
+      mime_type: "image/png",
+      bytes: PNG_1X1.byteLength,
+    }]);
+    assert.match(textOf(result), new RegExp(DC_IMAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   } finally {
     await close();
     stub.restore();

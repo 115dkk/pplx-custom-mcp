@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
@@ -2036,6 +2036,7 @@ function formatDcinsideComments(data) {
 const IMAGE_FETCH_BUDGET_MS = 12_000;
 const IMAGE_MAX_BYTES = 3_500_000;
 const IMAGE_TOTAL_MAX_BYTES = 9_000_000;
+const IMAGE_DEFAULT_MAX = 2;
 const IMAGE_SUPPORTED_MIME_RE = /^image\/(jpeg|png|gif|webp)$/;
 // UI chrome, emoticons (dccon), spacers, icons, logos — never article content.
 const IMAGE_URL_DENY_RE =
@@ -2043,7 +2044,7 @@ const IMAGE_URL_DENY_RE =
 
 function selectContentImageUrls(html, baseUrl, opts = {}) {
   if (!html) return [];
-  const max = Math.max(1, Math.min(Number(opts.max_images) || 4, 10));
+  const max = Math.max(1, Math.min(Number(opts.max_images) || IMAGE_DEFAULT_MAX, 10));
   const dcinside = isDcinsideUrl(baseUrl);
   let scope = html;
   if (dcinside) {
@@ -2067,7 +2068,20 @@ function selectContentImageUrls(html, baseUrl, opts = {}) {
   push(findMetaContent(html, ["og:image", "twitter:image", "twitter:image:src"]));
   for (const m of scope.matchAll(/<img\b[^>]*>/gi)) {
     const tag = m[0];
-    push(tagAttribute(tag, "src") || tagAttribute(tag, "data-original") || tagAttribute(tag, "data-src"));
+    // Lazy-loading pages commonly put a transparent placeholder in `src` and
+    // the real image in data-original/data-src/srcset. Prefer the real source.
+    const srcset = tagAttribute(tag, "data-srcset") || tagAttribute(tag, "srcset");
+    const srcsetCandidate = srcset
+      ? srcset.split(",").map((part) => part.trim().split(/\s+/)[0]).filter(Boolean).at(-1)
+      : "";
+    push(
+      tagAttribute(tag, "data-original")
+      || tagAttribute(tag, "data-src")
+      || tagAttribute(tag, "data-lazy-src")
+      || tagAttribute(tag, "data-url")
+      || srcsetCandidate
+      || tagAttribute(tag, "src")
+    );
     if (urls.length >= max * 4) break;
   }
   // DCinside: prefer genuinely uploaded post images (viewimage.php) when present.
@@ -2101,8 +2115,9 @@ function arrayBufferToBase64(buffer) {
 
 async function collectImageBlocks(urls, baseUrl, signal, opts = {}) {
   const blocks = [];
+  const images = [];
   const notes = [];
-  if (!Array.isArray(urls) || !urls.length) return { blocks, notes };
+  if (!Array.isArray(urls) || !urls.length) return { blocks, images, notes };
   const referer = isDcinsideUrl(baseUrl) ? "https://gall.dcinside.com/" : (baseUrl || "");
   let totalBytes = 0;
   for (const url of urls) {
@@ -2113,7 +2128,9 @@ async function collectImageBlocks(urls, baseUrl, signal, opts = {}) {
         headers: {
           "User-Agent": DCINSIDE_DESKTOP_UA,
           Referer: referer,
-          Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+          // Do not advertise AVIF/APNG: MCP clients are not consistently able
+          // to consume them and this server intentionally emits four formats.
+          Accept: "image/webp,image/png,image/jpeg,image/gif,*/*;q=0.8",
         },
         signal,
       });
@@ -2128,11 +2145,12 @@ async function collectImageBlocks(urls, baseUrl, signal, opts = {}) {
       if (totalBytes + buf.byteLength > IMAGE_TOTAL_MAX_BYTES) { notes.push("이미지 총 용량 한도 도달, 이후 생략"); break; }
       totalBytes += buf.byteLength;
       blocks.push({ type: "image", data: arrayBufferToBase64(buf), mimeType: mime });
+      images.push({ url, mime_type: mime, bytes: buf.byteLength });
     } catch (err) {
       notes.push(`이미지 로드 실패(${err && err.name === "AbortError" ? "timeout" : "error"}): ${url}`);
     }
   }
-  return { blocks, notes };
+  return { blocks, images, notes };
 }
 
 function redditMarkdownToText(markdown, opts = {}) {
@@ -3206,7 +3224,7 @@ function fetchCacheKey(url, opts) {
   key.searchParams.set("preset", resolveSitePreset(url, opts.site_preset || "auto"));
   key.searchParams.set("links", opts.include_links === false ? "0" : "1");
   key.searchParams.set("cmt", opts.include_comments === false ? "0" : "1");
-  key.searchParams.set("img", opts.include_images ? `1x${Math.max(1, Math.min(Number(opts.max_images) || 4, 10))}` : "0");
+  key.searchParams.set("img", opts.include_images ? `1x${Math.max(1, Math.min(Number(opts.max_images) || IMAGE_DEFAULT_MAX, 10))}` : "0");
   return new Request(key.toString(), { method: "GET" });
 }
 
@@ -4333,10 +4351,12 @@ async function fetchAndFormat(url, apiKey, opts = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_BUDGET_MS);
     try {
-      const { blocks, notes } = await collectImageBlocks(result.imageUrls, result.finalUrl || url, controller.signal, opts);
+      const { blocks, images, notes } = await collectImageBlocks(result.imageUrls, result.finalUrl || url, controller.signal, opts);
       imageContent = blocks;
       if (blocks.length) {
-        text += `\n\n[첨부 이미지 ${blocks.length}개 포함 — 멀티모달 모델이 직접 확인 가능${notes.length ? `; 일부 생략: ${notes.slice(0, 2).join(" | ")}` : ""}]`;
+        result.images = images;
+        const sources = images.map((image, index) => `- Image ${index + 1}: ${image.url}`).join("\n");
+        text += `\n\n[첨부 이미지 ${blocks.length}개 포함 — 멀티모달 모델이 직접 확인 가능${notes.length ? `; 일부 생략: ${notes.slice(0, 2).join(" | ")}` : ""}]\n${sources}`;
       } else if (notes.length) {
         text += `\n\n[이미지 첨부 실패: ${notes.slice(0, 3).join(" | ")}]`;
       }
@@ -4374,6 +4394,7 @@ function buildFetchStructured(url, result, text, opts = {}) {
   if (result.meta?.title) structuredResult.title = result.meta.title;
   if (result.structured) structuredResult.structured_data = result.structured;
   if (links.length) structuredResult.links = links;
+  if (Array.isArray(result.images) && result.images.length) structuredResult.images = result.images;
   if (page) structuredResult.page = page;
   if (typeof pageInfo?.hasNext === "boolean") structuredResult.has_next = pageInfo.hasNext;
   if (opts.debug && result.debugInfo) structuredResult.debug = result.debugInfo;
@@ -4392,7 +4413,7 @@ const SERVER_INSTRUCTIONS = [
   "Use explicit parameters for filters instead of burying filters in the query. Use search_domain_filter for domains, search_language_filter for language, search_recency_filter or date filters for time. Do not mix allowlist and denylist domain filters.",
   "auto_source_profile is enabled by default: queries that name Reddit, DCinside, NamuWiki, Steam, YouTube, GitHub, or a registered mainstream news outlet get matching search filters unless explicit source/search filters are supplied.",
   "source_profile can quickly focus a search: community, official, academic, reviews, korean_forums, news, or steam. Explicit user filters override profile defaults.",
-  "For fetch, cleaning_mode controls page cleanup. balanced is default; strict removes more UI/navigation; raw-ish preserves more text. include_links is enabled by default and preserves page links as Markdown plus structured links; set include_links=false to suppress link URLs. site_preset=auto detects known sites by URL, including registered news, MediaWiki, SAGE Journals, and SourceForge Allura wiki domains; site_preset=none disables site-specific handling. page/max_chars paginate long bodies. metadata_only is for source triage.",
+  "For fetch, cleaning_mode controls page cleanup. balanced is default; strict removes more UI/navigation; raw-ish preserves more text. include_links is enabled by default and preserves page links as Markdown plus structured links; set include_links=false to suppress link URLs. DCinside post images are attached automatically; for other sites, set include_images=true whenever the user asks about images, screenshots, charts, or visual details. site_preset=auto detects known sites by URL, including registered news, MediaWiki, SAGE Journals, and SourceForge Allura wiki domains; site_preset=none disables site-specific handling. page/max_chars paginate long bodies. metadata_only is for source triage.",
   "Always cite URLs from tool output. Search result indexes [N] are stable within that result set and should be kept when discussing evidence.",
 ].join(" ");
 
@@ -4407,7 +4428,7 @@ const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
   "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
-  "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Set include_images=true (max_images N) to also attach the post's content images as image blocks for multimodal models.",
+  "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
   "If the body exceeds max_chars, call again with the same URL and page+1.",
 ].join(" ");
 
@@ -4475,9 +4496,9 @@ const FETCH_INPUT_SHAPE = {
   include_comments: z.boolean().optional()
     .describe("For DCinside posts, fetch the full comment thread (replies included) via the comment API and append it under a '## 댓글' section, with comments also in structured output. Default true. Set false to skip comments."),
   include_images: z.boolean().optional()
-    .describe("Fetch the post's content images (UI chrome and emoticons excluded) and return them as image blocks so multimodal models can see them directly. Default false; increases response size."),
+    .describe("Fetch content images (UI chrome and emoticons excluded) and return image blocks plus source URLs. Automatically enabled for DCinside posts; otherwise default false. Set true when the user asks about images, screenshots, charts, or other visual content; set false to force text-only output."),
   max_images: z.number().int().min(1).max(10).optional()
-    .describe("Maximum content images to attach when include_images is true (default 4, max 10)."),
+    .describe(`Maximum content images to attach when include_images is true (default ${IMAGE_DEFAULT_MAX}, max 10).`),
   debug: z.boolean().optional()
     .describe("Include redirect/cache/attempt/content-type diagnostics."),
   use_cache: z.boolean().optional()
@@ -4534,6 +4555,12 @@ const LINK_OUTPUT = z.object({
   url: z.string(),
 });
 
+const IMAGE_OUTPUT = z.object({
+  url: z.string(),
+  mime_type: z.string(),
+  bytes: z.number().int(),
+});
+
 const FETCH_OUTPUT = z.object({
   url: z.string(),
   final_url: z.string().optional(),
@@ -4544,6 +4571,7 @@ const FETCH_OUTPUT = z.object({
   metadata: z.object({}).passthrough(),
   structured_data: z.object({}).passthrough().optional(),
   links: z.array(LINK_OUTPUT).optional(),
+  images: z.array(IMAGE_OUTPUT).optional(),
   page: FETCH_PAGE_OUTPUT.optional(),
   has_next: z.boolean().optional(),
   warnings: z.array(z.string()),
@@ -4604,11 +4632,15 @@ function validateSearchArgs(args) {
 // same three `?? "balanced"` / `?? "auto"` / `!== false` lines were copied into
 // every handler.
 function normalizeFetchOpts(args, overrides = {}) {
+  const sitePreset = args.site_preset ?? "auto";
+  const autoImages = !args.metadata_only && resolveSitePreset(args.url, sitePreset) === "dcinside";
   return {
     ...args,
     cleaning_mode: args.cleaning_mode ?? "balanced",
-    site_preset: args.site_preset ?? "auto",
+    site_preset: sitePreset,
     include_links: args.include_links !== false,
+    include_images: args.include_images ?? autoImages,
+    max_images: args.max_images ?? IMAGE_DEFAULT_MAX,
     ...overrides,
   };
 }

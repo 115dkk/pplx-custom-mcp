@@ -91,6 +91,18 @@ test("security: private image references are never selected for network fetch", 
   assert.deepEqual(selectContentImageUrls(html, "https://example.com/post"), ["https://example.com/public.png"]);
 });
 
+test("images: lazy-load sources beat placeholders and srcset uses the largest candidate", () => {
+  const html = `
+    <article>
+      <img src="/blank.gif" data-original="/photos/real.jpg">
+      <img src="/tiny.jpg" srcset="/small.webp 320w, /large.webp 1280w">
+    </article>`;
+  assert.deepEqual(selectContentImageUrls(html, "https://example.com/post", { max_images: 4 }), [
+    "https://example.com/photos/real.jpg",
+    "https://example.com/large.webp",
+  ]);
+});
+
 test("security: text responses are capped before extraction", async () => {
   const oversized = "x".repeat(FETCH_RESPONSE_MAX_BYTES + 1024);
   const text = await readTextResponse(
