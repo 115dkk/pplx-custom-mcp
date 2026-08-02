@@ -1,7 +1,7 @@
 {
   "//": "Targets for the live smoke run (scripts/live-smoke.mjs). These go through the DEPLOYED Worker to the real internet, so they catch site changes that fixture tests cannot. Only long-lived URLs belong here — forum posts and news articles rot within weeks.",
-  "//expect_source": "Which fetch path must serve the page, read from the `source:` header line. `direct` means plain HTTP worked. `perplexity` means every direct attempt was blocked and the paid site: fallback (~$0.005/call) stood in. Listing both accepts either, so a target that starts working directly does not fail the run.",
-  "//blocked": "Verified 2026-08-02 from Cloudflare Worker egress: namu.wiki, sourceforge.net (including its Allura REST endpoint) and fandom.com answer 403 or a Cloudflare interstitial to every UA. Their entries therefore expect the Perplexity fallback, not a direct fetch. Wikipedia rejects the Googlebot UA but serves the desktop one, so attempt 2 succeeds.",
+  "//expect_source": "Which fetch path must serve the page, read from the `source:` header line. `direct` means plain HTTP worked, `agent-fetch-url` means the exact URL was retrieved through Perplexity Agent API, and `perplexity` means the final same-document search fallback stood in. Listing multiple values accepts any healthy path.",
+  "//blocked": "Verified 2026-08-02 from Cloudflare Worker egress: namu.wiki, sourceforge.net (including its Allura REST endpoint) and fandom.com answer 403 or a Cloudflare interstitial to every UA. The Agent API fetch_url step now retrieves the first two without abandoning Workers. Wikipedia rejects the Googlebot UA but serves the desktop one, so attempt 2 succeeds.",
   "targets": [
     {
       "name": "steam store page",

@@ -10,6 +10,11 @@ const FETCH_PER_ATTEMPT_MS = 8_000;
 const FETCH_TOTAL_BUDGET_MS = 25_000;
 const FETCH_MAX_CHARS_DEFAULT = 8_000;
 const FETCH_MAX_CHARS_LIMIT = 32_000;
+const FETCH_URL_MAX_LENGTH = 4_096;
+// A hostile or misconfigured origin must not make a 128 MB Worker buffer an
+// unbounded response before the extractor has a chance to trim it.
+const FETCH_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
+const SERVER_REDIRECT_LIMIT = 5;
 const SPA_SHELL_THRESHOLD = 200;
 const SIMPLE_CHALLENGE_BODY_SCAN_LIMIT = 80_000;
 // looksBlocked strips inline script/style from this much source, then inspects
@@ -51,6 +56,71 @@ const SOURCE_PROFILES = ["general", "community", "official", "academic", "review
 
 const DOCUMENT_EXT_RE = /\.(pdf|doc|docx|ppt|pptx|xls|xlsx|csv|tsv)(?:[?#]|$)/i;
 const DOCUMENT_CONTENT_RE = /(application\/pdf|application\/msword|application\/vnd\.openxmlformats|application\/vnd\.ms-|application\/octet-stream|text\/csv|text\/tab-separated-values)/i;
+
+function isNonPublicIpv4(hostname) {
+  const parts = hostname.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return false;
+  const octets = parts.map(Number);
+  if (octets.some((part) => part > 255)) return true;
+  const [a, b, c] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113) ||
+    a >= 224
+  );
+}
+
+function isNonPublicIpv6(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host.includes(":")) return false;
+  const halves = host.split("::");
+  if (halves.length > 2) return true;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  if (halves.length === 1 && left.length !== 8) return true;
+  const fill = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (fill < 0) return true;
+  const rawGroups = [...left, ...Array(fill).fill("0"), ...right];
+  if (rawGroups.length !== 8 || rawGroups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return true;
+  const groups = rawGroups.map((group) => Number.parseInt(group, 16));
+  const allZero = groups.every((group) => group === 0);
+  const loopback = groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1;
+  const ipv4Mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff;
+  return (
+    allZero ||
+    loopback ||
+    ipv4Mapped ||
+    (groups[0] & 0xfe00) === 0xfc00 || // unique-local fc00::/7
+    (groups[0] & 0xffc0) === 0xfe80 || // link-local fe80::/10
+    (groups[0] & 0xff00) === 0xff00 || // multicast ff00::/8
+    (groups[0] === 0x2001 && groups[1] === 0x0db8) || // documentation
+    (groups[0] === 0x2001 && groups[1] === 0x0002) || // benchmarking
+    groups[0] === 0x2002 // 6to4 can encode non-public IPv4 targets
+  );
+}
+
+function isSafeFetchUrl(value) {
+  try {
+    if (String(value).length > FETCH_URL_MAX_LENGTH) return false;
+    const target = new URL(value);
+    if (target.protocol !== "http:" && target.protocol !== "https:") return false;
+    if (target.username || target.password) return false;
+    const hostname = target.hostname.toLowerCase().replace(/\.$/, "");
+    if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost")) return false;
+    if (isNonPublicIpv4(hostname) || isNonPublicIpv6(hostname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** @type {Array<[string, string, string[], string[], string[]?]>} */
 const NEWS_SOURCE_ROWS = [
@@ -765,12 +835,145 @@ function charsetFromContentType(contentType) {
 }
 
 async function readTextResponse(res, contentType) {
-  const buffer = await res.arrayBuffer();
+  const reader = res.body?.getReader?.();
+  let bytes;
+  if (reader) {
+    const chunks = [];
+    let total = 0;
+    while (total < FETCH_RESPONSE_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      const remaining = FETCH_RESPONSE_MAX_BYTES - total;
+      const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+      chunks.push(chunk);
+      total += chunk.byteLength;
+      if (chunk.byteLength < value.byteLength || total >= FETCH_RESPONSE_MAX_BYTES) {
+        try { await reader.cancel(); } catch { /* response is already closed */ }
+        break;
+      }
+    }
+    bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+  } else {
+    const buffer = await res.arrayBuffer();
+    bytes = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, FETCH_RESPONSE_MAX_BYTES));
+  }
   const charset = charsetFromContentType(contentType);
   try {
-    return new TextDecoder(charset).decode(buffer);
+    return new TextDecoder(charset).decode(bytes);
   } catch {
-    return new TextDecoder("utf-8").decode(buffer);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+}
+
+async function readBinaryResponse(res, maxBytes) {
+  const reader = res.body?.getReader?.();
+  if (!reader) {
+    const buffer = await res.arrayBuffer();
+    return {
+      buffer: buffer.slice(0, maxBytes),
+      truncated: buffer.byteLength > maxBytes,
+    };
+  }
+
+  const chunks = [];
+  let total = 0;
+  let truncated = false;
+  while (total <= maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value?.byteLength) continue;
+    const remaining = maxBytes + 1 - total;
+    const chunk = value.byteLength > remaining ? value.subarray(0, remaining) : value;
+    chunks.push(chunk);
+    total += chunk.byteLength;
+    if (chunk.byteLength < value.byteLength || total > maxBytes) {
+      truncated = true;
+      try { await reader.cancel(); } catch { /* response is already closed */ }
+      break;
+    }
+  }
+
+  const kept = Math.min(total, maxBytes);
+  const bytes = new Uint8Array(kept);
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset >= kept) break;
+    const part = chunk.subarray(0, kept - offset);
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  return { buffer: bytes.buffer, truncated: truncated || total > maxBytes };
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+async function fetchWithSafeRedirects(url, init = {}, cookieJar = null, cookieOrigin = "") {
+  let currentUrl = String(url);
+  let method = String(init.method || "GET").toUpperCase();
+  let body = init.body;
+  const baseHeaders = new Headers(init.headers || {});
+
+  for (let redirectCount = 0; ; redirectCount++) {
+    if (!isSafeFetchUrl(currentUrl)) {
+      throw new Error("Unsafe redirect target was blocked.");
+    }
+    const current = new URL(currentUrl);
+    const headers = new Headers(baseHeaders);
+    const mayUseCookies = !!cookieOrigin && current.origin === cookieOrigin;
+    if (mayUseCookies) {
+      const cookies = cookieHeader(cookieJar);
+      if (cookies) headers.set("Cookie", cookies);
+      else headers.delete("Cookie");
+    } else {
+      headers.delete("Cookie");
+      headers.delete("Authorization");
+      headers.delete("Proxy-Authorization");
+      headers.delete("Origin");
+      if (headers.has("Sec-Fetch-Site")) headers.set("Sec-Fetch-Site", "cross-site");
+    }
+
+    const response = await fetch(currentUrl, {
+      ...init,
+      method,
+      body,
+      headers,
+      redirect: "manual",
+    });
+    if (mayUseCookies) storeResponseCookies(cookieJar, response.headers);
+
+    const location = response.headers.get("location");
+    if (!REDIRECT_STATUSES.has(response.status) || !location) return response;
+    if (redirectCount >= SERVER_REDIRECT_LIMIT) {
+      try { await response.body?.cancel?.(); } catch { /* ignore */ }
+      throw new Error(`Too many redirects (max ${SERVER_REDIRECT_LIMIT}).`);
+    }
+
+    let nextUrl;
+    try {
+      nextUrl = new URL(location, currentUrl).toString();
+    } catch {
+      try { await response.body?.cancel?.(); } catch { /* ignore */ }
+      throw new Error("Invalid redirect target was blocked.");
+    }
+    if (!isSafeFetchUrl(nextUrl)) {
+      try { await response.body?.cancel?.(); } catch { /* ignore */ }
+      throw new Error("Unsafe redirect target was blocked.");
+    }
+
+    if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === "POST")) {
+      method = "GET";
+      body = undefined;
+      baseHeaders.delete("Content-Type");
+      baseHeaders.delete("Content-Length");
+    }
+    try { await response.body?.cancel?.(); } catch { /* ignore */ }
+    currentUrl = nextUrl;
   }
 }
 
@@ -956,10 +1159,9 @@ async function submitSteamAgeCheck(originalUrl, pageUrl, html, ua, signal, cooki
     init.body = submission.params.toString();
   }
 
-  const res = await fetch(requestUrl, init);
-  storeResponseCookies(cookieJar, res.headers);
+  const res = await fetchWithSafeRedirects(requestUrl, init, cookieJar, new URL(pageUrl).origin);
   let body = "";
-  try { body = await res.text(); } catch { /* ignore */ }
+  try { body = await readTextResponse(res, res.headers.get("content-type") || ""); } catch { /* ignore */ }
   let result = { status: res.status, body, finalUrl: res.url || requestUrl, label: submission.label };
 
   if (looksSteamAgeGate(result.finalUrl, result.body)) {
@@ -994,21 +1196,18 @@ async function submitSimpleChallenge(pageUrl, html, ua, signal, cookieJar) {
     init.body = submission.params.toString();
   }
 
-  const res = await fetch(requestUrl, init);
-  storeResponseCookies(cookieJar, res.headers);
+  const res = await fetchWithSafeRedirects(requestUrl, init, cookieJar, new URL(pageUrl).origin);
   let body = "";
-  try { body = await res.text(); } catch { /* ignore */ }
+  try { body = await readTextResponse(res, res.headers.get("content-type") || ""); } catch { /* ignore */ }
   return { status: res.status, body, finalUrl: res.url || requestUrl, label: submission.label };
 }
 
 async function fetchOnce(url, ua, signal, cookieJar, sitePreset = "auto") {
-  const res = await fetch(url, {
+  const res = await fetchWithSafeRedirects(url, {
     method: "GET",
     headers: fetchHeaders(ua, cookieJar, sitePresetHeaders(sitePreset)),
-    redirect: "follow",
     signal,
-  });
-  storeResponseCookies(cookieJar, res.headers);
+  }, cookieJar, new URL(url).origin);
   const status = res.status;
   const finalUrl = res.url || url;
   const contentType = res.headers.get("content-type") || "";
@@ -1299,7 +1498,7 @@ function isTextualResponse(url, contentType) {
 function safeResolveUrl(baseUrl, candidate) {
   try {
     const target = new URL(decodeEntities(candidate).trim(), baseUrl);
-    if (target.protocol === "http:" || target.protocol === "https:") return target.toString();
+    if (isSafeFetchUrl(target.toString())) return target.toString();
   } catch { /* invalid URL */ }
   return "";
 }
@@ -1347,6 +1546,7 @@ function isDcinsideAuthOrSinkUrl(url) {
 }
 
 function shouldFollowClientRedirect(baseUrl, targetUrl, preset) {
+  if (!isSafeFetchUrl(targetUrl)) return false;
   if (preset === "dcinside" && isDcinsideUrl(baseUrl) && isDcinsideAuthOrSinkUrl(targetUrl)) return false;
   if (preset === "news" && isNewsRedirectSinkUrl(targetUrl, baseUrl)) return false;
   return true;
@@ -1805,7 +2005,7 @@ function selectContentImageUrls(html, baseUrl, opts = {}) {
   const push = (raw) => {
     if (!raw || raw.startsWith("data:") || raw.includes("${")) return;
     const abs = safeResolveUrl(baseUrl, raw);
-    if (!abs) return;
+    if (!abs || !isSafeFetchUrl(abs)) return;
     if (/\.svg(?:[?#]|$)/i.test(abs)) return;
     if (IMAGE_URL_DENY_RE.test(abs)) return;
     const key = abs.split("#")[0];
@@ -1857,19 +2057,19 @@ async function collectImageBlocks(urls, baseUrl, signal, opts = {}) {
   let totalBytes = 0;
   for (const url of urls) {
     if (signal?.aborted) { notes.push("이미지 시간 초과로 일부 생략"); break; }
+    if (!isSafeFetchUrl(url)) { notes.push(`비공개/유효하지 않은 이미지 URL 생략: ${url}`); continue; }
     try {
-      const res = await fetch(url, {
+      const res = await fetchWithSafeRedirects(url, {
         headers: {
           "User-Agent": DCINSIDE_DESKTOP_UA,
           Referer: referer,
           Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         },
         signal,
-        redirect: "follow",
       });
       if (!res.ok) { notes.push(`이미지 HTTP ${res.status}: ${url}`); continue; }
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength > IMAGE_MAX_BYTES) { notes.push(`용량 초과(${Math.round(buf.byteLength / 1024)}KB): ${url}`); continue; }
+      const { buffer: buf, truncated } = await readBinaryResponse(res, IMAGE_MAX_BYTES);
+      if (truncated) { notes.push(`용량 초과(${Math.round(IMAGE_MAX_BYTES / 1024)}KB+): ${url}`); continue; }
       if (!buf.byteLength) { notes.push(`빈 응답: ${url}`); continue; }
       // DCinside returns application/octet-stream, so prefer byte sniffing over the header.
       const headerMime = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
@@ -2511,7 +2711,7 @@ async function fetchSourceForgeAllura(url, mode, signal, opts = {}) {
   });
   const contentType = res.headers.get("content-type") || "";
   const contentLength = res.headers.get("content-length") || "";
-  const raw = await res.text();
+  const raw = await readTextResponse(res, contentType);
   if (!res.ok || !/json/i.test(contentType)) return null;
   let data;
   try {
@@ -3217,6 +3417,9 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
 }
 
 async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
+  if (!isSafeFetchUrl(url)) {
+    throw new Error("Only public HTTP(S) URLs without embedded credentials can be fetched.");
+  }
   const normalizedOpts = {
     cleaning_mode: normalizeCleaningMode(opts.cleaning_mode),
     site_preset: resolveSitePreset(url, opts.site_preset || "auto"),
@@ -4200,8 +4403,13 @@ const SEARCH_INPUT_SHAPE = {
     .describe("Domain filter. Allowlist: [\"nature.com\"]. Denylist: [\"-reddit.com\"]. Do not mix allow and deny. Use domains/TLDs only, no protocol/path."),
 };
 
+const FETCH_URL_SCHEMA = z.string()
+  .max(FETCH_URL_MAX_LENGTH)
+  .url()
+  .refine(isSafeFetchUrl, "Only public HTTP(S) URLs without embedded credentials are allowed.");
+
 const FETCH_INPUT_SHAPE = {
-  url: z.string().url().describe("Absolute URL to fetch."),
+  url: FETCH_URL_SCHEMA.describe("Absolute public HTTP(S) URL to fetch."),
   max_chars: z.number().int().min(500).max(FETCH_MAX_CHARS_LIMIT).optional()
     .describe(`Body characters per page (default ${FETCH_MAX_CHARS_DEFAULT}, max ${FETCH_MAX_CHARS_LIMIT}). Headers and diagnostics do not count against this budget.`),
   page: z.number().int().min(1).max(1000).optional()
@@ -4229,7 +4437,7 @@ const FETCH_INPUT_SHAPE = {
 };
 
 const FETCH_MANY_INPUT_SHAPE = {
-  urls: z.array(z.string().url()).min(1).max(FETCH_MANY_LIMIT).describe(`URLs to fetch, max ${FETCH_MANY_LIMIT}.`),
+  urls: z.array(FETCH_URL_SCHEMA).min(1).max(FETCH_MANY_LIMIT).describe(`Public HTTP(S) URLs to fetch, max ${FETCH_MANY_LIMIT}.`),
   max_chars: z.number().int().min(500).max(12000).optional().describe("Body characters per URL (default 4000)."),
   page: z.number().int().min(1).max(1000).optional().describe("Body page number to return for every URL (default 1)."),
   cleaning_mode: z.enum(CLEANING_MODES).optional().describe("Content cleaning strength: strict, balanced, raw-ish."),
@@ -4533,6 +4741,11 @@ export {
   extractMetadata,
   decodeEntities,
   paginateText,
+  isSafeFetchUrl,
+  readTextResponse,
+  readBinaryResponse,
+  fetchWithSafeRedirects,
+  FETCH_RESPONSE_MAX_BYTES,
   // Site routing
   resolveSitePreset,
   isDcinsideUrl,

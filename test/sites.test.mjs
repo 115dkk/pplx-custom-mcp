@@ -65,7 +65,7 @@ test("steam: the age gate is detected and answered with an adult birth date", ()
 test("steam: end-to-end fetch walks through the age gate to the store page", async () => {
   const stub = installFetch([
     { url: "https://store.steampowered.com/agecheckset/", method: "POST", body: STEAM_HTML },
-    { url: STEAM_URL, body: (url, init) => ((init.headers?.Cookie || "").includes("wants_mature_content") ? STEAM_HTML : STEAM_GATE_HTML) },
+    { url: STEAM_URL, body: (url, init) => ((new Headers(init.headers).get("cookie") || "").includes("wants_mature_content") ? STEAM_HTML : STEAM_GATE_HTML) },
   ]);
   try {
     const { result, text } = await fetchAndFormat(STEAM_URL, "", OFFLINE);

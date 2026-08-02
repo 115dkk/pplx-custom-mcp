@@ -5,7 +5,7 @@ Cloudflare Workers 위에서 도는 MCP 서버입니다. Perplexity `/search` �
 일반 웹 검색이 잘 못 긁는 곳 — 커뮤니티, 포럼, 게임 스토어, 댓글, 가볍게 막힌 페이지 — 을 노린 물건입니다.
 
 - **런타임**: Cloudflare Workers 무료 티어 (Durable Object 불필요, stateless)
-- **비용**: Workers 무료. Perplexity API 비용은 `perplexity_search` 호출에만 발생하고 `perplexity_fetch`는 공짜
+- **비용**: Workers 무료. `perplexity_fetch`의 직접 경로는 무료이며, 403·SPA 셸·문서 URL에서만 Perplexity `fetch_url`(도구 호출 $0.0005 + 모델 토큰)과 검색 폴백($0.005)을 순서대로 사용
 - **라이선스**: MIT
 
 ---
@@ -32,7 +32,7 @@ Perplexity `/search` 기반 랭킹 검색 미리보기. `[1] [2] [3]` 번호가 
 - 비용: 호출당 약 $0.005
 
 ### `perplexity_fetch`
-URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. **Perplexity API를 쓰지 않으므로 무료.**
+URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경로는 무료이고, 모든 직접 시도가 막힌 경우에만 Perplexity Agent API `fetch_url`을 사용한 뒤 필요하면 동일 문서가 맞는지 검증하는 검색 폴백을 사용합니다.
 
 - `url`(필수), `max_chars`(기본 8000, 상한 32000), `page`(기본 1), `cleaning_mode`(`strict`/`balanced`/`raw-ish`)
 - `site_preset`: `auto`가 URL로 사이트를 판별. `none`이면 사이트별 처리를 끔
@@ -52,7 +52,7 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. **Perplexity
 | 뉴스 | 국내외 주요 언론사 도메인 레지스트리, 레거시 한글 인코딩 디코딩, JSON-LD/Arc/일반 본문 추출, 공유·폰트·로그인·광고·관련기사 제거 |
 | Steam | 성인 연령 확인 폼 자동 통과, 앱 ID/이름/출시일/가격/태그 구조화 |
 
-그 외 공통: UA 로테이션, 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적, 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용.
+그 외 공통: UA 로테이션, 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적, 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용. 직접 fetch가 403·봇 차단·빈 SPA 셸로 끝나면 `fetch_url`로 정확한 URL의 본문을 요청하고, 거부·오류·타임아웃이면 기존 Perplexity 검색 폴백으로 이어집니다.
 
 `robots.txt`는 준수하지 않습니다. 크롤러가 아니라 지목된 URL 하나를 가져오는 fetch 유틸이기 때문입니다.
 
@@ -78,6 +78,13 @@ npx wrangler deploy
 배포 후 Claude.ai → Settings → Connectors → Add custom connector에 `https://<워커주소>/mcp`를 등록하면 됩니다.
 
 CI에서 자동 배포하려면 저장소 시크릿에 `CLOUDFLARE_API_TOKEN`(필요하면 `CLOUDFLARE_ACCOUNT_ID`)을 넣어두면 `main` 푸시마다 테스트 통과 후 배포됩니다.
+
+### 보안 메모
+
+- `/mcp`에는 Cloudflare Rate Limiting binding으로 클라이언트당 분당 60회 제한이 적용됩니다.
+- fetch 입력은 공개 `http`/`https` URL만 허용하며 localhost, 사설·링크로컬 IP, URL 내 자격증명을 거부합니다. 원격 텍스트 응답은 추출 전에 4 MiB로 제한됩니다.
+- 현재 커넥터는 인증 없이 공개되어 있습니다. Rate limiting은 비용 폭주 완화책이지 인증이 아닙니다. 다중 사용자나 민감한 도구로 확장하기 전에는 MCP 표준 OAuth 2.1 보호 리소스 흐름을 추가해야 합니다.
+- GitHub CI는 high/critical npm 경보를 배포 차단 조건으로 사용하며, CodeQL과 Dependabot이 주기적으로 재점검합니다.
 
 ---
 

@@ -60,11 +60,11 @@ curl -X POST https://perplexity-mcp.<계정명>.workers.dev/mcp \
 
 - **Stateless**: `createMcpHandler` 사용 (Durable Object 불필요, 무료 티어 호환)
 - **MCP SDK ≥1.26.0 호환**: 요청마다 새 McpServer 인스턴스 생성
-- **4개 도구** (v1.1.0):
+- **4개 도구** (v1.2.0):
   - `perplexity_search` — Perplexity `/search` 호출, source_profile/dedupe/date signals 지원, ~$0.005/회
-  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션 (무료, Perplexity API 호출 없음)
+  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션. 직접 경로가 막히면 Perplexity `fetch_url`, 이어서 동일 문서 검증 검색 폴백 사용
   - `perplexity_fetch_many` — 여러 URL을 하나의 evidence pack으로 fetch
   - `perplexity_search_fetch` — 검색 + dedupe + 상위 K개 fetch 원샷 워크플로
   - 모든 도구는 `outputSchema`와 `structuredContent`를 제공
 - **CORS**: 모든 origin 허용 (Claude.ai 브라우저 클라이언트 지원)
-- **비용**: Workers 무료. Perplexity API 비용은 search 호출에만 발생 (fetch는 무료).
+- **비용**: Workers 무료. 직접 fetch는 무료. 막힌 페이지의 `fetch_url`은 도구 호출 $0.0005 + 모델 토큰 비용이며, 후속 검색 폴백은 호출당 $0.005.

@@ -4,5 +4,15 @@
   "compatibility_date": "2025-09-23",
   "compatibility_flags": [
     "nodejs_compat"
+  ],
+  "ratelimits": [
+    {
+      "name": "MCP_RATE_LIMITER",
+      "namespace_id": "820260802",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    }
   ]
 }

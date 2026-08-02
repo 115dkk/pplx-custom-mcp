@@ -6,6 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  FETCH_RESPONSE_MAX_BYTES,
   fetchAndFormat,
   fetchPageWithFallbacks,
   formatFetchResult,
@@ -20,6 +21,10 @@ import {
   isDocumentUrl,
   hasMeaningfulHtmlContent,
   fetchHeaders,
+  fetchWithSafeRedirects,
+  isSafeFetchUrl,
+  readTextResponse,
+  selectContentImageUrls,
 } from "../src/index.js";
 import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
@@ -32,6 +37,68 @@ const BODY_SENTENCE = /almost none of it reading the page/;
 const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const IPHONE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
 const GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+test("security: only public credential-free HTTP(S) targets are accepted", () => {
+  for (const url of [
+    "file:///etc/passwd",
+    "http://localhost/admin",
+    "http://127.0.0.1/admin",
+    "http://[::1]/admin",
+    "http://[2001:0db8::1]/docs",
+    "http://[fc00::1]/admin",
+    "http://10.0.0.1/",
+    "http://169.254.169.254/latest/meta-data/",
+    "https://user:secret@example.com/",
+  ]) {
+    assert.equal(isSafeFetchUrl(url), false, `${url} should be rejected`);
+  }
+  assert.equal(isSafeFetchUrl("https://example.com/article"), true);
+  assert.equal(isSafeFetchUrl("http://1.1.1.1/"), true);
+});
+
+test("security: redirects cannot reach private targets or forward credentials cross-origin", async () => {
+  const privateMock = installFetch([
+    { url: "https://example.com/start", status: 302, headers: { location: "http://127.0.0.1/admin" } },
+  ]);
+  await assert.rejects(
+    fetchWithSafeRedirects("https://example.com/start"),
+    /Unsafe redirect target/
+  );
+  assert.equal(privateMock.calls.length, 1);
+  privateMock.restore();
+
+  const publicMock = installFetch([
+    { url: "https://example.com/start", status: 302, headers: { location: "https://other.example/final" } },
+    { url: "https://other.example/final", body: "ok" },
+  ]);
+  const response = await fetchWithSafeRedirects("https://example.com/start", {
+    headers: {
+      Authorization: "Bearer secret",
+      Cookie: "session=secret",
+      Origin: "https://example.com",
+    },
+  }, new Map([["session", "secret"]]), "https://example.com");
+  assert.equal(await response.text(), "ok");
+  const redirectedHeaders = new Headers(publicMock.calls[1].headers);
+  assert.equal(redirectedHeaders.has("authorization"), false);
+  assert.equal(redirectedHeaders.has("cookie"), false);
+  assert.equal(redirectedHeaders.has("origin"), false);
+  publicMock.restore();
+});
+
+test("security: private image references are never selected for network fetch", () => {
+  const html = '<article><img src="http://169.254.169.254/latest/meta-data/"><img src="/public.png"></article>';
+  assert.deepEqual(selectContentImageUrls(html, "https://example.com/post"), ["https://example.com/public.png"]);
+});
+
+test("security: text responses are capped before extraction", async () => {
+  const oversized = "x".repeat(FETCH_RESPONSE_MAX_BYTES + 1024);
+  const text = await readTextResponse(
+    new Response(oversized, { headers: { "content-type": "text/plain; charset=utf-8" } }),
+    "text/plain; charset=utf-8"
+  );
+  assert.equal(new TextEncoder().encode(text).byteLength, FETCH_RESPONSE_MAX_BYTES);
+});
 
 test("headers: a browser UA is backed by the metadata that browser would send", () => {
   // Cloudflare-fronted sites answer 403 to a request claiming to be Chrome that

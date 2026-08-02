@@ -58,10 +58,22 @@ jobs:
       - name: Report bundle size
         run: du -sh dist && ls -la dist
 
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Fail on high or critical npm advisories
+        run: npm audit --audit-level=high
+
   deploy:
     name: Deploy to Cloudflare Workers
     # Every gate must be green first. A RED test never reaches this job.
-    needs: [test, typecheck, build]
+    needs: [test, typecheck, build, security]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     environment: production

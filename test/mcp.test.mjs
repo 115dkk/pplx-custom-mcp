@@ -184,6 +184,12 @@ test("mcp: invalid arguments are reported as tool errors, not silently coerced",
       ["perplexity_search", { query: "x", search_after_date_filter: "2026-01-01" }, "date filter in the wrong format"],
       ["perplexity_fetch", {}, "missing required url"],
       ["perplexity_fetch", { url: "https://example.com", cleaning_mode: "nope" }, "unknown cleaning_mode"],
+      ["perplexity_fetch", { url: "file:///etc/passwd" }, "non-HTTP URL"],
+      ["perplexity_fetch", { url: "http://127.0.0.1/admin" }, "IPv4 loopback URL"],
+      ["perplexity_fetch", { url: "http://[::1]/admin" }, "IPv6 loopback URL"],
+      ["perplexity_fetch", { url: "http://169.254.169.254/latest/meta-data/" }, "link-local metadata URL"],
+      ["perplexity_fetch", { url: "https://user:secret@example.com/" }, "URL with embedded credentials"],
+      ["perplexity_fetch_many", { urls: ["https://example.com", "http://10.0.0.1/"] }, "private URL in a batch"],
     ]) {
       const result = await client.callTool({ name, arguments: args });
       assert.equal(result.isError, true, `${label} was accepted by ${name}`);

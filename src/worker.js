@@ -6,6 +6,7 @@ import { createServer, VERSION } from "./index.js";
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const isMcpPath = url.pathname === "/mcp" || url.pathname === "/mcp/";
 
     if (url.pathname === "/health" && request.method === "GET") {
       return new Response(
@@ -23,6 +24,33 @@ export default {
           "Access-Control-Expose-Headers": "Mcp-Session-Id, mcp-protocol-version",
         },
       });
+    }
+
+    if (!isMcpPath) return new Response("Not found", { status: 404 });
+    if (!["GET", "POST", "DELETE"].includes(request.method)) {
+      return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST, DELETE, OPTIONS" } });
+    }
+
+    if (env.MCP_RATE_LIMITER?.limit) {
+      const clientKey = request.headers.get("cf-connecting-ip") || "unknown-client";
+      const { success } = await env.MCP_RATE_LIMITER.limit({ key: clientKey });
+      if (!success) {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            error: { code: -32029, message: "Rate limit exceeded. Retry in 60 seconds." },
+            id: null,
+          }),
+          {
+            status: 429,
+            headers: {
+              "Content-Type": "application/json",
+              "Retry-After": "60",
+              "Access-Control-Allow-Origin": "*",
+            },
+          }
+        );
+      }
     }
 
     const apiKey = env.PERPLEXITY_API_KEY;
