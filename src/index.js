@@ -2924,6 +2924,209 @@ async function writeFetchCache(url, opts, result) {
   } catch { /* cache is best-effort */ }
 }
 
+// The fields every degraded result echoes back from the last response we saw.
+// Repeated verbatim in six payloads before this existed.
+function lastResponseFields(last) {
+  return {
+    html: last.body,
+    status: last.status,
+    finalUrl: last.finalUrl,
+    contentType: last.contentType,
+    contentLength: last.contentLength,
+  };
+}
+
+// Why the direct fetch did not produce a body. Same three-way choice was
+// spelled out at each of the three degradation points.
+function degradationCause(flags) {
+  if (flags.steamAgeGate) return "steamAgeGate";
+  if (flags.blocked) return "blocked";
+  return "shell";
+}
+
+const DEGRADATION_TEXT = {
+  perplexity: {
+    steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
+    blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
+    shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
+  },
+  metadata: {
+    steamAgeGate: "[경고: Steam 성인 연령 확인 + Perplexity 폴백 실패, 메타데이터만 추출]",
+    blocked: "[경고: 봇 차단 + Perplexity 폴백 실패, 메타데이터만 추출]",
+    shell: "[경고: JS 렌더링 + Perplexity 폴백 실패, 메타데이터만 추출]",
+  },
+};
+
+function failureText(flags, status) {
+  switch (degradationCause(flags)) {
+    case "steamAgeGate":
+      return `[경고: Steam 성인 연령 확인 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
+    case "blocked":
+      return `[경고: 봇 차단 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
+    default:
+      return `[경고: 응답 본문 부족(HTTP ${status}) + Perplexity 폴백 실패]`;
+  }
+}
+
+// SourceForge blocks its own HTML pages but leaves the Allura REST API open, so
+// the wiki JSON is tried before any HTML attempt rather than after.
+// Returns a result object, or null to fall through to the normal path.
+async function trySourceForgeAlluraRest(url, opts, signal, warnings, debugInfo) {
+  const restUrl = buildSourceForgeRestUrl(url);
+  if (!restUrl) return null;
+  try {
+    const page = await fetchSourceForgeAllura(url, opts.cleaning_mode, signal, opts);
+    if (!page) return null;
+    warnings.push("SourceForge HTML page is bot-blocked; fetched Allura REST wiki JSON instead");
+    debugInfo.attempts.push({
+      ua: 1,
+      url: page.restUrl || restUrl,
+      urlKind: "sourceforge-allura-rest",
+      status: page.status,
+      finalUrl: page.finalUrl || url,
+      contentType: page.contentType,
+      contentLength: page.contentLength,
+      bodyChars: page.html?.length || 0,
+    });
+    return {
+      ok: true,
+      text: page.text,
+      html: page.html,
+      status: page.status,
+      attempt: 1,
+      attempt_total: 1,
+      warnings,
+      source: "sourceforge-allura",
+      meta: page.meta,
+      finalUrl: page.finalUrl,
+      contentType: page.contentType,
+      contentLength: page.contentLength,
+      structured: page.structured,
+    };
+  } catch (err) {
+    warnings.push(`SourceForge Allura REST fallback failed: ${String(err).slice(0, 200)}`);
+    return null;
+  }
+}
+
+// SAGE articles that are open access are mirrored on PubMed Central, reachable
+// by DOI when the publisher blocks us. Tried after the direct attempts fail.
+async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
+  try {
+    const article = await fetchSageViaPmc(url, opts.cleaning_mode, signal, opts);
+    if (!article) return null;
+    warnings.push("SAGE direct fetch blocked; fetched PubMed Central open-access mirror by DOI");
+    return {
+      ok: true,
+      text: article.text,
+      html: article.html,
+      status: article.status,
+      attempt: attemptTotal + 1,
+      warnings,
+      partial: true,
+      source: "sage-pmc",
+      meta: article.meta,
+      finalUrl: article.finalUrl,
+      contentType: article.contentType,
+      contentLength: article.contentLength,
+      structured: article.structured,
+    };
+  } catch (err) {
+    warnings.push(`SAGE PMC fallback failed: ${String(err).slice(0, 200)}`);
+    return null;
+  }
+}
+
+// Every direct attempt is spent. Walk the remaining ladder — document handling,
+// the paid Perplexity site: fallback, page metadata — and return whatever still
+// carries information, rather than nothing at all. Caller applies finish().
+async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags }) {
+  if (flags.document) {
+    if (apiKey) {
+      try {
+        const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
+        if (pplxText) {
+          return {
+            ok: true,
+            text: `[Document URL detected: direct binary parsing is not available in this Worker. Perplexity domain fallback was used.]\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
+            attempt: attemptTotal + 1,
+            warnings,
+            partial: true,
+            source: "document-perplexity",
+            meta: {},
+            ...lastResponseFields(last),
+          };
+        }
+      } catch (err) {
+        warnings.push(`document fallback failed: ${String(err).slice(0, 200)}`);
+      }
+    }
+    return {
+      ok: false,
+      text: `[Document URL detected (${last.contentType || "unknown content type"}). Direct binary parsing is not available in this Worker, and Perplexity fallback did not return usable text.]`,
+      attempt: attemptTotal,
+      warnings,
+      partial: true,
+      source: "document",
+      meta: {},
+      ...lastResponseFields(last),
+    };
+  }
+
+  // Compute meta once; both remaining paths and the tool handler reuse it.
+  const meta = last.body ? extractMetadata(last.body) : {};
+  const metaText = last.body
+    ? [meta.title && `# ${meta.title}`, meta.description, meta.jsonLd, meta.noscript]
+        .filter(Boolean).join("\n\n").trim()
+    : "";
+  const cause = degradationCause(flags);
+
+  // Costs ~$0.005 but works on Cloudflare-protected SPAs that pre-render for no UA.
+  if (apiKey) {
+    try {
+      const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
+      if (pplxText) {
+        return {
+          ok: true,
+          text: `${DEGRADATION_TEXT.perplexity[cause]}\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
+          attempt: attemptTotal + 1,
+          warnings,
+          partial: true,
+          source: "perplexity",
+          meta,
+          ...lastResponseFields(last),
+        };
+      }
+    } catch (err) {
+      warnings.push(`Perplexity 폴백 실패: ${String(err).slice(0, 200)}`);
+    }
+  }
+
+  if (metaText) {
+    return {
+      ok: true,
+      text: `${DEGRADATION_TEXT.metadata[cause]}\n\n${cleanText(metaText, opts.cleaning_mode)}`,
+      attempt: attemptTotal,
+      warnings,
+      partial: true,
+      source: "metadata",
+      meta,
+      ...lastResponseFields(last),
+    };
+  }
+
+  return {
+    ok: false,
+    text: failureText(flags, last.status),
+    attempt: attemptTotal,
+    warnings,
+    partial: true,
+    source: "none",
+    meta,
+    ...lastResponseFields(last),
+  };
+}
+
 async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   const normalizedOpts = {
     cleaning_mode: normalizeCleaningMode(opts.cleaning_mode),
@@ -2983,42 +3186,8 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
 
   try {
     if (normalizedOpts.site_preset === "sourceforge") {
-      const restUrl = buildSourceForgeRestUrl(url);
-      if (restUrl) {
-        try {
-          const sourceForgePage = await fetchSourceForgeAllura(url, normalizedOpts.cleaning_mode, overallController.signal, normalizedOpts);
-          if (sourceForgePage) {
-            warnings.push("SourceForge HTML page is bot-blocked; fetched Allura REST wiki JSON instead");
-            debugInfo.attempts.push({
-              ua: 1,
-              url: sourceForgePage.restUrl || restUrl,
-              urlKind: "sourceforge-allura-rest",
-              status: sourceForgePage.status,
-              finalUrl: sourceForgePage.finalUrl || url,
-              contentType: sourceForgePage.contentType,
-              contentLength: sourceForgePage.contentLength,
-              bodyChars: sourceForgePage.html?.length || 0,
-            });
-            return finish({
-              ok: true,
-              text: sourceForgePage.text,
-              html: sourceForgePage.html,
-              status: sourceForgePage.status,
-              attempt: 1,
-              attempt_total: 1,
-              warnings,
-              source: "sourceforge-allura",
-              meta: sourceForgePage.meta,
-              finalUrl: sourceForgePage.finalUrl,
-              contentType: sourceForgePage.contentType,
-              contentLength: sourceForgePage.contentLength,
-              structured: sourceForgePage.structured,
-            });
-          }
-        } catch (err) {
-          warnings.push(`SourceForge Allura REST fallback failed: ${String(err).slice(0, 200)}`);
-        }
-      }
+      const page = await trySourceForgeAlluraRest(url, normalizedOpts, overallController.signal, warnings, debugInfo);
+      if (page) return finish(page);
     }
 
     for (let i = 0; i < userAgents.length; i++) {
@@ -3233,158 +3402,32 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
     }
 
     if (normalizedOpts.site_preset === "sage") {
-      try {
-        const pmcArticle = await fetchSageViaPmc(url, normalizedOpts.cleaning_mode, overallController.signal, normalizedOpts);
-        if (pmcArticle) {
-          warnings.push("SAGE direct fetch blocked; fetched PubMed Central open-access mirror by DOI");
-          return finish({
-            ok: true,
-            text: pmcArticle.text,
-            html: pmcArticle.html,
-            status: pmcArticle.status,
-            attempt: userAgents.length + 1,
-            warnings,
-            partial: true,
-            source: "sage-pmc",
-            meta: pmcArticle.meta,
-            finalUrl: pmcArticle.finalUrl,
-            contentType: pmcArticle.contentType,
-            contentLength: pmcArticle.contentLength,
-            structured: pmcArticle.structured,
-          });
-        }
-      } catch (err) {
-        warnings.push(`SAGE PMC fallback failed: ${String(err).slice(0, 200)}`);
-      }
+      const article = await trySagePmcMirror(url, normalizedOpts, overallController.signal, warnings, userAgents.length);
+      if (article) return finish(article);
     }
 
-    if (documentSeen && apiKey) {
-      try {
-        const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
-        if (pplxText) {
-          return finish({
-            ok: true,
-            text: `[Document URL detected: direct binary parsing is not available in this Worker. Perplexity domain fallback was used.]\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
-            html: lastBody,
-            status: lastStatus,
-            attempt: userAgents.length + 1,
-            warnings,
-            partial: true,
-            source: "document-perplexity",
-            meta: {},
-            finalUrl: lastFinalUrl,
-            contentType: lastContentType,
-            contentLength: lastContentLength,
-          });
-        }
-      } catch (err) {
-        warnings.push(`document fallback failed: ${String(err).slice(0, 200)}`);
-      }
-    }
-
-    if (documentSeen) {
-      return finish({
-        ok: false,
-        text: `[Document URL detected (${lastContentType || "unknown content type"}). Direct binary parsing is not available in this Worker, and Perplexity fallback did not return usable text.]`,
-        html: lastBody,
-        status: lastStatus,
-        attempt: userAgents.length,
-        warnings,
-        partial: true,
-        source: "document",
-        meta: {},
-        finalUrl: lastFinalUrl,
-        contentType: lastContentType,
-        contentLength: lastContentLength,
-      });
-    }
-
-    // All UAs exhausted or all returned shells.
-    // Compute meta once from the last body we got; reused by both fallback paths and the tool handler.
-    const meta = lastBody ? extractMetadata(lastBody) : {};
-    let metaText = "";
-    if (lastBody) {
-      metaText = [
-        meta.title && `# ${meta.title}`,
-        meta.description,
-        meta.jsonLd,
-        meta.noscript,
-      ].filter(Boolean).join("\n\n").trim();
-    }
-
-    // Final fallback: Perplexity /search with site: trick.
-    // Costs ~$0.005 but works on Cloudflare-protected SPAs that don't pre-render for any UA.
-    if (apiKey) {
-      try {
-        const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
-        if (pplxText) {
-          const reason = steamAgeGateSeen
-            ? "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]"
-            : blockedSeen
-            ? "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]"
-            : "[직접 fetch가 SPA 셸만 반환 → Perplexity site: 폴백 사용 (비용 ~$0.005)]";
-          return finish({
-            ok: true,
-            text: `${reason}\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
-            html: lastBody,
-            status: lastStatus,
-            attempt: userAgents.length + 1,
-            warnings,
-            partial: true,
-            source: "perplexity",
-            meta,
-            finalUrl: lastFinalUrl,
-            contentType: lastContentType,
-            contentLength: lastContentLength,
-          });
-        }
-      } catch (err) {
-        warnings.push(`Perplexity 폴백 실패: ${String(err).slice(0, 200)}`);
-      }
-    }
-
-    // Metadata-only as second-to-last resort.
-    if (metaText) {
-      const reason = steamAgeGateSeen
-        ? "[경고: Steam 성인 연령 확인 + Perplexity 폴백 실패, 메타데이터만 추출]"
-        : blockedSeen
-        ? "[경고: 봇 차단 + Perplexity 폴백 실패, 메타데이터만 추출]"
-        : "[경고: JS 렌더링 + Perplexity 폴백 실패, 메타데이터만 추출]";
-      const out = `${reason}\n\n${cleanText(metaText, normalizedOpts.cleaning_mode)}`;
-      return finish({
-        ok: true,
-        text: out,
-        html: lastBody,
-        status: lastStatus,
-        attempt: userAgents.length,
-        warnings,
-        partial: true,
-        source: "metadata",
-        meta,
-        finalUrl: lastFinalUrl,
-        contentType: lastContentType,
-        contentLength: lastContentLength,
-      });
-    }
-
-    return finish({
-      ok: false,
-      text: steamAgeGateSeen
-        ? `[경고: Steam 성인 연령 확인 감지(HTTP ${lastStatus}) + Perplexity 폴백 실패, 본문 추출 실패]`
-        : blockedSeen
-        ? `[경고: 봇 차단 감지(HTTP ${lastStatus}) + Perplexity 폴백 실패, 본문 추출 실패]`
-        : `[경고: 응답 본문 부족(HTTP ${lastStatus}) + Perplexity 폴백 실패]`,
-      html: lastBody,
-      status: lastStatus,
-      attempt: userAgents.length,
+    // Every UA is spent, or every response was a shell. Hand off to the
+    // fallback ladder; it decides between document handling, the paid
+    // Perplexity fallback, page metadata, and outright failure.
+    return finish(await resolveExhaustedFetch({
+      url,
+      apiKey,
+      opts: normalizedOpts,
       warnings,
-      partial: true,
-      source: "none",
-      meta,
-      finalUrl: lastFinalUrl,
-      contentType: lastContentType,
-      contentLength: lastContentLength,
-    });
+      attemptTotal: userAgents.length,
+      last: {
+        status: lastStatus,
+        body: lastBody,
+        finalUrl: lastFinalUrl,
+        contentType: lastContentType,
+        contentLength: lastContentLength,
+      },
+      flags: {
+        blocked: blockedSeen,
+        steamAgeGate: steamAgeGateSeen,
+        document: documentSeen,
+      },
+    }));
   } finally {
     clearTimeout(overallTimer);
   }
