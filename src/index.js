@@ -4633,7 +4633,11 @@ function validateSearchArgs(args) {
 // every handler.
 function normalizeFetchOpts(args, overrides = {}) {
   const sitePreset = args.site_preset ?? "auto";
-  const autoImages = !args.metadata_only && resolveSitePreset(args.url, sitePreset) === "dcinside";
+  const dcPost = dcinsideIdNo(args.url);
+  const autoImages = !args.metadata_only
+    && resolveSitePreset(args.url, sitePreset) === "dcinside"
+    && !!dcPost.id
+    && !!dcPost.no;
   return {
     ...args,
     cleaning_mode: args.cleaning_mode ?? "balanced",

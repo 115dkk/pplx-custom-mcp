@@ -15,6 +15,7 @@ const ARTICLE_URL = "https://example.com/blog/no-headless";
 const ARTICLE_HTML = fixture("generic-article.html");
 const SEARCH_JSON = fixture("perplexity-search.json");
 const DC_URL = "https://gall.dcinside.com/board/view/?id=programming&no=1234567";
+const DC_LIST_URL = "https://gall.dcinside.com/board/lists/?id=programming";
 const DC_IMAGE_URL = "https://dcimg4.dcinside.co.kr/viewimage.php?id=programming&no=1234567&file=post.png";
 const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 
@@ -135,6 +136,26 @@ test("mcp: DCinside content images attach automatically with source metadata", a
       bytes: PNG_1X1.byteLength,
     }]);
     assert.match(textOf(result), new RegExp(DC_IMAGE_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    await close();
+    stub.restore();
+  }
+});
+
+test("mcp: DCinside list pages stay text-only unless images are requested", async () => {
+  const listPage = `<html><body><main><p>This DCinside list page contains enough useful text to be treated as real content, but its thumbnails are navigation rather than post content.</p><img src="${DC_IMAGE_URL}"></main></body></html>`;
+  const stub = installFetch([
+    { url: DC_IMAGE_URL, body: PNG_1X1, headers: { "content-type": "image/png" } },
+    { url: "https://gall.dcinside.com/board/lists/", body: listPage },
+  ]);
+  const { client, close } = await connect();
+  try {
+    const result = await client.callTool({
+      name: "perplexity_fetch",
+      arguments: { url: DC_LIST_URL, include_comments: false, use_cache: false },
+    });
+    assert.equal((result.content || []).some((block) => block.type === "image"), false);
+    assert.equal(stub.matching("viewimage.php").length, 0, "a list-page thumbnail was fetched automatically");
   } finally {
     await close();
     stub.restore();
