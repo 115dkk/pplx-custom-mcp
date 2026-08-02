@@ -12,6 +12,10 @@ const FETCH_MAX_CHARS_DEFAULT = 8_000;
 const FETCH_MAX_CHARS_LIMIT = 32_000;
 const SPA_SHELL_THRESHOLD = 200;
 const SIMPLE_CHALLENGE_BODY_SCAN_LIMIT = 80_000;
+// looksBlocked strips inline script/style from this much source, then inspects
+// the first BLOCK_SCAN_LIMIT characters of what is left.
+const BLOCK_SCAN_SOURCE_LIMIT = 200_000;
+const BLOCK_SCAN_LIMIT = 4_000;
 const CLIENT_REDIRECT_LIMIT = 2;
 const CACHE_TTL_SECONDS_DEFAULT = 300;
 const FETCH_MANY_LIMIT = 5;
@@ -967,7 +971,18 @@ function looksBlocked(status, body, pageUrl = "") {
   if (status === 403 || status === 503 || status === 429) return true;
   if (isDcinsideAuthOrSinkUrl(pageUrl)) return true;
   // Common challenge/verification page markers (HTTP 200 with bot-block content).
-  const lower = body.slice(0, 4000).toLowerCase();
+  //
+  // Scan rendered markup only. Inline config blobs name captcha providers as
+  // ordinary settings — Wikipedia ships
+  // "wgConfirmEditCaptchaNeededForGenericEdit":"hcaptcha" in its <head> — and
+  // matching those threw away a perfectly good page, then paid for the
+  // Perplexity fallback to fetch it again. Challenge pages carry their markers
+  // in visible text and element attributes, which survive this strip.
+  const lower = body
+    .slice(0, BLOCK_SCAN_SOURCE_LIMIT)
+    .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, " ")
+    .slice(0, BLOCK_SCAN_LIMIT)
+    .toLowerCase();
   return (
     lower.includes("just a moment") ||
     lower.includes("checking your browser") ||

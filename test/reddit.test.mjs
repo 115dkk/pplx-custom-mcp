@@ -32,6 +32,26 @@ test("reddit: the verification interstitial is recognised as blocked", () => {
   assert.equal(looksBlocked(200, BLOCKED_HTML, POST_URL), true);
   assert.equal(looksBlocked(403, "", POST_URL), true);
   assert.equal(looksBlocked(200, "<html><p>ordinary page</p></html>", POST_URL), false);
+
+  // A real Cloudflare interstitial keeps its markers in visible markup.
+  assert.equal(
+    looksBlocked(200, '<html><head><title>Just a moment...</title></head><body><div class="cf-turnstile" data-sitekey="abc"></div></body></html>', "https://example.com/"),
+    true
+  );
+});
+
+test("block detection: a captcha named in an inline config blob is not a block", () => {
+  // Wikipedia ships "wgConfirmEditCaptchaNeededForGenericEdit":"hcaptcha" in a
+  // <script> in its <head>. Matching that discarded every Wikipedia page as
+  // bot-blocked and then paid for the Perplexity fallback to fetch it again.
+  const page = [
+    "<html><head><script>",
+    'var RLCONF = {"wgConfirmEditCaptchaNeededForGenericEdit":"hcaptcha","wgConfirmEditHCaptchaSiteKey":"5d0c670e"};',
+    "</script></head><body><article><p>",
+    "This page has real prose in it and must not be mistaken for a challenge screen. ".repeat(4),
+    "</p></article></body></html>",
+  ].join("");
+  assert.equal(looksBlocked(200, page, "https://en.wikipedia.org/wiki/Anycast"), false);
 });
 
 test("reddit: post JSON yields title, self text, and threaded comments", () => {
