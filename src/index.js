@@ -203,7 +203,33 @@ const NEWS_SOURCES = NEWS_SOURCE_ROWS.map(([site, country, languages, domains, a
 }));
 
 const NEWS_DOMAINS = [...new Set(NEWS_SOURCES.flatMap((source) => source.domains))];
-const MEDIAWIKI_DOMAINS = ["k-wiki.kr"];
+// Sites that render MediaWiki markup, so #mw-content-text / .mw-parser-output
+// extraction applies. Matching is suffix-based, which covers every language
+// subdomain (en.wikipedia.org, ko.wikipedia.org, …) from one entry.
+// A miss is cheap: extractMediaWikiArticleData returns null when the expected
+// containers are absent and the page falls back to generic extraction.
+const MEDIAWIKI_DOMAINS = [
+  "k-wiki.kr",
+  // Wikimedia family
+  "wikipedia.org",
+  "wikimedia.org",
+  "wiktionary.org",
+  "wikiquote.org",
+  "wikibooks.org",
+  "wikisource.org",
+  "wikinews.org",
+  "wikiversity.org",
+  "wikivoyage.org",
+  "wikidata.org",
+  // Large MediaWiki hosts
+  "fandom.com",
+  "miraheze.org",
+  "wiki.gg",
+  "gamepedia.com",
+  // Korean MediaWiki wikis
+  "librewiki.net",
+  "lunawiki.kr",
+];
 const SAGE_DOMAINS = ["journals.sagepub.com"];
 const SOURCEFORGE_DOMAINS = ["sourceforge.net"];
 
@@ -1937,8 +1963,12 @@ function extractNamuWikiData(url, html, mode = "balanced", opts = {}) {
 const MEDIAWIKI_BOILERPLATE_ATTR_RE = /(?:^|[\s_-])(mw-editsection|toc|catlinks|printfooter|navbox|metadata|ambox|headAlert|noprint|thumb|tright|tleft|floatright|floatleft|gallery)(?:$|[\s_-])/i;
 
 function stripMediaWikiBoilerplateHtml(html) {
+  // No regex shortcut for mw-editsection here: MediaWiki nests bracket spans
+  // inside it (`<span class=mw-editsection><span>[</span><a><span>edit</span>…`),
+  // so a non-greedy `[\s\S]*?</span>` stops at the first inner close tag and
+  // leaves an orphaned "edit" in the body. The depth-aware guard loop below
+  // already matches mw-editsection and removes the whole element.
   let out = String(html || "")
-    .replace(/<span\b[^>]*class=["'][^"']*mw-editsection[^"']*["'][\s\S]*?<\/span>/gi, "")
     .replace(/<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi, "")
     .replace(/<input\b[^>]*>/gi, "");
 
@@ -1962,23 +1992,46 @@ function stripMediaWikiBoilerplateHtml(html) {
   return out;
 }
 
+// Table-of-contents heading, in the languages the registry actually covers.
+const MEDIAWIKI_TOC_HEADING_RE = /^(목차|Contents|Table of contents)$/i;
+// Section edit affordances: "[편집]", "[edit]", "[edit | edit source]".
+const MEDIAWIKI_EDIT_MARKER_RE = /^\[\s*(편집(?:\s*\|\s*원본 편집)?|edit(?:\s*\|\s*edit source)?)\s*\]$/i;
+// Skin chrome that survives as bare one-word lines. Deliberately conservative:
+// "History", "Contents", "Tools" and "Search" are all plausible section
+// headings, so only phrases that cannot be article headings belong here.
+const MEDIAWIKI_UI_LINE_RE =
+  /^(편집|원본 편집|문서|토론|읽기|역사|보기|도구|이동|검색|edit source|view source|view history|jump to content)$/i;
+
 function cleanMediaWikiText(text) {
   const out = [];
   let inToc = false;
   for (const rawLine of String(text || "").replace(/\r\n?/g, "\n").split(/\n+/)) {
     const line = rawLine.replace(/[ \t]+/g, " ").trim();
     if (!line) continue;
-    if (/^목차$/i.test(line)) {
+    if (MEDIAWIKI_TOC_HEADING_RE.test(line)) {
       inToc = true;
       continue;
     }
     if (inToc && /^\d+(?:\.\d+)*\s+\S/.test(line)) continue;
     if (inToc) inToc = false;
-    if (/^\[\s*편집(?:\s*\|\s*원본 편집)?\s*\]$/i.test(line)) continue;
-    if (/^(편집|원본 편집|문서|토론|읽기|역사|보기|도구|이동|검색)$/i.test(line)) continue;
+    if (MEDIAWIKI_EDIT_MARKER_RE.test(line)) continue;
+    if (MEDIAWIKI_UI_LINE_RE.test(line)) continue;
     out.push(line);
   }
   return out.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// "Anycast - Wikipedia" -> "Wikipedia". Wikimedia sites do not emit
+// og:site_name, so the <title> suffix is the only in-page signal.
+function mediaWikiSiteName(meta, url) {
+  if (meta.siteName) return meta.siteName;
+  const fromTitle = String(meta.title || "").match(/\s+[-–—|]\s+([^-–—|]{2,40})\s*$/)?.[1]?.trim();
+  if (fromTitle) return fromTitle;
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 function extractMediaWikiArticleData(url, html, mode = "balanced", opts = {}) {
@@ -1992,7 +2045,7 @@ function extractMediaWikiArticleData(url, html, mode = "balanced", opts = {}) {
   const body = cleanMediaWikiText(htmlToText(stripMediaWikiBoilerplateHtml(bodyHtml), mode, { include_links: opts.include_links !== false, base_url: url }));
   if (!body || body.length < 80) return null;
 
-  const site = meta.siteName || "K-위키";
+  const site = mediaWikiSiteName(meta, url);
   const header = [
     title ? `# ${title}` : "",
     site ? `Site: ${site}` : "",

@@ -19,8 +19,10 @@ import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
 const NAMU_URL = "https://namu.wiki/w/서버리스";
 const KWIKI_URL = "https://k-wiki.kr/wiki/엣지_컴퓨팅";
+const WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/Anycast";
 const NAMU_HTML = fixture("namu-article.html");
 const KWIKI_HTML = fixture("mediawiki-article.html");
+const WIKIPEDIA_HTML = fixture("wikipedia-article.html");
 
 test("wiki: hosts route to their presets", () => {
   assert.equal(isNamuWikiUrl(NAMU_URL), true);
@@ -28,6 +30,25 @@ test("wiki: hosts route to their presets", () => {
   assert.equal(isMediaWikiUrl("https://example.org/wiki/X"), false);
   assert.equal(resolveSitePreset(NAMU_URL, "auto"), "namu");
   assert.equal(resolveSitePreset(KWIKI_URL, "auto"), "mediawiki");
+});
+
+test("wiki: the MediaWiki registry covers the wikis it claims to", () => {
+  for (const url of [
+    "https://en.wikipedia.org/wiki/Anycast",
+    "https://ko.wikipedia.org/wiki/애니캐스트",
+    "https://commons.wikimedia.org/wiki/Main_Page",
+    "https://en.wiktionary.org/wiki/anycast",
+    "https://minecraft.fandom.com/wiki/Redstone",
+    "https://terraria.wiki.gg/wiki/Boss",
+    "https://librewiki.net/wiki/리브레_위키",
+    "https://k-wiki.kr/wiki/엣지_컴퓨팅",
+  ]) {
+    assert.equal(resolveSitePreset(url, "auto"), "mediawiki", `${url} is not routed to the MediaWiki extractor`);
+  }
+  // Look-alikes must not be swept in.
+  assert.equal(resolveSitePreset("https://namu.wiki/w/x", "auto"), "namu");
+  assert.equal(resolveSitePreset("https://notwikipedia.org/wiki/x", "auto"), "auto");
+  assert.equal(resolveSitePreset("https://example.com/wiki/x", "auto"), "auto");
 });
 
 test("namu: article body survives while notices and TOC are removed", () => {
@@ -77,6 +98,53 @@ test("mediawiki: mw-content-text body is extracted and chrome removed", () => {
 test("mediawiki: line cleaner strips the TOC block and UI verbs", () => {
   const cleaned = cleanMediaWikiText(["목차", "1 개요", "1.1 배경", "읽기", "[편집]", "실제 본문 문장입니다."].join("\n"));
   assert.equal(cleaned, "실제 본문 문장입니다.");
+
+  const english = cleanMediaWikiText(["Contents", "1 History", "2 Applications", "[edit]", "[edit | edit source]", "Jump to content", "A real body sentence."].join("\n"));
+  assert.equal(english, "A real body sentence.");
+});
+
+test("mediawiki: chrome words that are also plausible headings are kept", () => {
+  // "History", "Contents", "Tools" and "Search" are ordinary section titles.
+  // Filtering them by text would silently delete article structure.
+  const kept = cleanMediaWikiText(["History", "Tools", "Search", "Body sentence that must survive."].join("\n"));
+  for (const heading of ["History", "Tools", "Search"]) {
+    assert.match(kept, new RegExp(`^${heading}$`, "m"), `"${heading}" was treated as chrome`);
+  }
+});
+
+test("wikipedia: article body, headings, and site name are extracted", () => {
+  const article = extractMediaWikiArticleData(WIKIPEDIA_URL, WIKIPEDIA_HTML, "balanced", {});
+  assert.ok(article, "extractor returned null — the article body would be missing");
+
+  assert.match(article.text, /^# Anycast/);
+  // Site name comes from the <title> suffix; Wikimedia emits no og:site_name.
+  assert.match(article.text, /^Site: Wikipedia$/m, "site name was not derived from the page title");
+
+  assert.match(article.text, /single destination IP address is shared/);
+  assert.match(article.text, /topologically nearest member of the group/);
+  assert.match(article.text, /^History$/m, "section heading was dropped");
+  assert.match(article.text, /first formally described in 1993/);
+  assert.match(article.text, /^Applications$/m, "section heading was dropped");
+  assert.match(article.text, /absorb denial-of-service traffic/, "last section dropped — body was truncated");
+
+  assert.doesNotMatch(article.text, /Jump to content/, "skin chrome leaked into the body");
+  assert.doesNotMatch(article.text, /Figure 1\./, "thumbnail caption leaked into the body");
+  assert.doesNotMatch(article.text, /Internet architecture/, "category links leaked into the body");
+  assert.doesNotMatch(article.text, /Retrieved from/, "print footer leaked into the body");
+
+  assert.equal(article.structured.type, "mediawiki_article");
+  assert.equal(article.structured.canonical, WIKIPEDIA_URL);
+});
+
+test("wikipedia: nested mw-editsection markup leaves no stray 'edit' in the body", () => {
+  // MediaWiki wraps the affordance as
+  // <span class=mw-editsection><span>[</span><a><span>edit</span></a><span>]</span></span>.
+  // A non-greedy span regex stops at the first inner </span> and orphans "edit"
+  // next to every heading; only depth-aware removal handles it.
+  const article = extractMediaWikiArticleData(WIKIPEDIA_URL, WIKIPEDIA_HTML, "balanced", { include_links: false });
+  const strays = article.text.split("\n").filter((line) => /^edit$/i.test(line.trim()));
+  assert.equal(strays.length, 0, `${strays.length} stray edit affordance(s) leaked into the body`);
+  assert.doesNotMatch(article.text, /action=edit&amp;section=/, "edit link URL leaked into the body");
 });
 
 test("wiki: end-to-end fetches return non-empty bodies", async () => {
