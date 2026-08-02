@@ -688,13 +688,68 @@ function cookieHeader(cookieJar) {
   return [...cookieJar.entries()].map(([name, value]) => `${name}=${value}`).join("; ");
 }
 
-function fetchHeaders(ua, cookieJar, extra = {}) {
+// Header sets a real browser sends alongside a navigation request. Several
+// Cloudflare-fronted sites (namu.wiki among them) answer 403 to a request that
+// carries only a browser User-Agent but none of the fetch-metadata or client
+// hints that browser would also send — the mismatch is the signal, not the UA.
+//
+// The hints have to agree with the UA: Googlebot and app UAs send neither
+// Sec-Fetch-* nor sec-ch-ua, and Safari sends Sec-Fetch-* but no client hints.
+// Claiming Chrome hints under a Googlebot UA is a worse tell than sending none.
+const NAVIGATION_ACCEPT =
+  "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8";
+
+// Fetch metadata differs per request kind; sending navigation metadata on an
+// XHR is itself a mismatch, so each call site declares what it is doing.
+const SEC_FETCH_BY_KIND = {
+  navigate: {
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+  },
+  form: {
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+  },
+  xhr: {
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+  },
+};
+
+const CHROME_CLIENT_HINTS = {
+  "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+};
+
+function browserRequestHeaders(ua, kind) {
+  const agent = String(ua || "");
+  // Crawlers and in-app clients send neither fetch metadata nor client hints.
+  if (/googlebot|bingbot|bot\/|dcinside\.app|perplexity-mcp/i.test(agent)) return {};
+  const secFetch = SEC_FETCH_BY_KIND[kind] || SEC_FETCH_BY_KIND.navigate;
+  // Client hints are Chromium-only; Safari sends fetch metadata but no hints.
+  if (/\bChrome\/\d+/.test(agent) && !/\bMobile\b/.test(agent)) {
+    return { ...secFetch, ...CHROME_CLIENT_HINTS };
+  }
+  return { ...secFetch };
+}
+
+/** @param {"navigate"|"form"|"xhr"} [kind] */
+function fetchHeaders(ua, cookieJar, extra = {}, kind = "navigate") {
   /** @type {Record<string, string>} */
   const headers = {
     "User-Agent": ua,
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ko,en-US;q=0.9,en;q=0.8",
+    Accept: NAVIGATION_ACCEPT,
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Cache-Control": "no-cache",
+    ...browserRequestHeaders(ua, kind),
     ...extra,
   };
   const cookies = cookieHeader(cookieJar);
@@ -883,7 +938,7 @@ async function submitSteamAgeCheck(originalUrl, pageUrl, html, ua, signal, cooki
   const headers = fetchHeaders(ua, cookieJar, {
     Referer: pageUrl,
     Origin: new URL(pageUrl).origin,
-  });
+  }, "form");
   let requestUrl = submission.target.toString();
   const init = {
     method: submission.method,
@@ -921,7 +976,7 @@ async function submitSimpleChallenge(pageUrl, html, ua, signal, cookieJar) {
 
   const extraHeaders = { Referer: pageUrl };
   if (submission.method === "POST") extraHeaders.Origin = new URL(pageUrl).origin;
-  const headers = fetchHeaders(ua, cookieJar, extraHeaders);
+  const headers = fetchHeaders(ua, cookieJar, extraHeaders, "form");
   let requestUrl = submission.target.toString();
   const init = {
     method: submission.method,
@@ -1621,7 +1676,7 @@ async function fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, s
     Accept: "application/json, text/javascript, */*; q=0.01",
     Origin: "https://gall.dcinside.com",
     Referer: dcinsideViewUrl(idNo.id, idNo.no, gallType),
-  });
+  }, "xhr");
   const res = await fetch(DCINSIDE_COMMENT_ENDPOINT, {
     method: "POST",
     headers,
@@ -4398,6 +4453,10 @@ export {
   formatDcinsideComments,
   dcinsideIdNo,
   dcinsideGallType,
+  // Request shaping
+  fetchHeaders,
+  browserRequestHeaders,
+
   // Anti-bot and redirects
   extractClientRedirect,
   looksBlocked,

@@ -19,6 +19,7 @@ import {
   normalizeCleaningMode,
   isDocumentUrl,
   hasMeaningfulHtmlContent,
+  fetchHeaders,
 } from "../src/index.js";
 import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
@@ -27,6 +28,56 @@ const ARTICLE_HTML = fixture("generic-article.html");
 const SPA_HTML = fixture("spa-shell.html");
 
 const BODY_SENTENCE = /almost none of it reading the page/;
+
+const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const IPHONE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+const GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+
+test("headers: a browser UA is backed by the metadata that browser would send", () => {
+  // Cloudflare-fronted sites answer 403 to a request claiming to be Chrome that
+  // carries none of Chrome's fetch metadata or client hints. The mismatch is
+  // the signal, not the User-Agent.
+  const nav = fetchHeaders(CHROME_UA, new Map(), {}, "navigate");
+  assert.equal(nav["Sec-Fetch-Dest"], "document");
+  assert.equal(nav["Sec-Fetch-Mode"], "navigate");
+  assert.equal(nav["Sec-Fetch-Site"], "none");
+  assert.equal(nav["Upgrade-Insecure-Requests"], "1");
+  assert.match(nav["sec-ch-ua"], /Chromium/);
+  assert.equal(nav["sec-ch-ua-platform"], '"Windows"');
+  assert.match(nav.Accept, /^text\/html,application\/xhtml\+xml/);
+});
+
+test("headers: fetch metadata matches the request kind", () => {
+  const xhr = fetchHeaders(CHROME_UA, new Map(), {}, "xhr");
+  assert.equal(xhr["Sec-Fetch-Dest"], "empty");
+  assert.equal(xhr["Sec-Fetch-Mode"], "cors");
+  assert.equal(xhr["Sec-Fetch-Site"], "same-origin");
+  assert.equal(xhr["Sec-Fetch-User"], undefined, "an XHR is not a user-initiated navigation");
+  assert.equal(xhr["Upgrade-Insecure-Requests"], undefined);
+
+  const form = fetchHeaders(CHROME_UA, new Map(), {}, "form");
+  assert.equal(form["Sec-Fetch-Site"], "same-origin", "a challenge form posts back to its own origin");
+  assert.equal(form["Sec-Fetch-Mode"], "navigate");
+});
+
+test("headers: non-Chromium and crawler agents do not claim Chromium hints", () => {
+  const safari = fetchHeaders(IPHONE_UA, new Map(), {}, "navigate");
+  assert.equal(safari["Sec-Fetch-Dest"], "document", "Safari does send fetch metadata");
+  assert.equal(safari["sec-ch-ua"], undefined, "client hints are Chromium-only");
+
+  for (const ua of [GOOGLEBOT_UA, "dcinside.app"]) {
+    const bot = fetchHeaders(ua, new Map(), {}, "navigate");
+    assert.equal(bot["Sec-Fetch-Dest"], undefined, `${ua} must not send fetch metadata`);
+    assert.equal(bot["sec-ch-ua"], undefined, `${ua} must not send client hints`);
+    assert.equal(bot["User-Agent"], ua);
+  }
+});
+
+test("headers: explicit per-call headers still win", () => {
+  const h = fetchHeaders(CHROME_UA, new Map(), { Accept: "application/json", "Sec-Fetch-Site": "cross-site" }, "xhr");
+  assert.equal(h.Accept, "application/json");
+  assert.equal(h["Sec-Fetch-Site"], "cross-site");
+});
 
 test("core: metadata is lifted from head tags", () => {
   const meta = extractMetadata(ARTICLE_HTML);
