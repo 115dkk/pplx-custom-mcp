@@ -508,18 +508,22 @@ function findHtmlTagEnd(lower, tagName, fromIndex) {
   return -1;
 }
 
-function stripRawTextElements(value) {
+function stripHtmlElementBlocks(value, tagNames) {
   const source = String(value || "");
   const lower = source.toLowerCase();
   let output = "";
   let cursor = 0;
   while (cursor < source.length) {
-    const scriptStart = findHtmlTagStart(lower, "script", cursor);
-    const styleStart = findHtmlTagStart(lower, "style", cursor);
-    const starts = [scriptStart, styleStart].filter((index) => index >= 0);
-    if (!starts.length) break;
-    const start = Math.min(...starts);
-    const tagName = start === scriptStart ? "script" : "style";
+    let start = -1;
+    let tagName = "";
+    for (const candidateTag of tagNames) {
+      const candidateStart = findHtmlTagStart(lower, candidateTag, cursor);
+      if (candidateStart >= 0 && (start < 0 || candidateStart < start)) {
+        start = candidateStart;
+        tagName = candidateTag;
+      }
+    }
+    if (start < 0) break;
     const openEnd = lower.indexOf(">", start + tagName.length + 1);
     if (openEnd < 0) break;
     const closeEnd = findHtmlTagEnd(lower, tagName, openEnd + 1);
@@ -527,6 +531,10 @@ function stripRawTextElements(value) {
     cursor = closeEnd >= 0 ? closeEnd : openEnd + 1;
   }
   return output + source.slice(cursor);
+}
+
+function stripRawTextElements(value) {
+  return stripHtmlElementBlocks(value, ["script", "style"]);
 }
 
 function structuralPatternsForMode(mode) {
@@ -1618,7 +1626,7 @@ const ARTICLE_CONTAINER_TAGS = ["article", "main", "body"];
 // Tag names that are chrome regardless of their attributes (news pages only).
 const NEWS_NOISE_TAGS_RE = /^(aside|nav|footer|header|figure|figcaption)$/i;
 // Elements that never contribute text and can go before any attribute analysis.
-const BOILERPLATE_INERT_TAGS_RE = /<(noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1\s*>/gi;
+const BOILERPLATE_INERT_TAGS = ["script", "style", "noscript", "iframe", "svg", "canvas", "form", "button", "select", "textarea"];
 // Defensive stop only; real pages never approach it.
 const BOILERPLATE_MAX_REMOVALS = 5000;
 
@@ -1636,8 +1644,7 @@ const BOILERPLATE_MAX_REMOVALS = 5000;
  * @param {{ attrPattern: RegExp, keepTags?: string[], noiseTagPattern?: RegExp|null, includeAriaLabel?: boolean }} options
  */
 function stripBoilerplateElements(html, { attrPattern, keepTags = [], noiseTagPattern = null, includeAriaLabel = false }) {
-  let out = stripRawTextElements(html)
-    .replace(BOILERPLATE_INERT_TAGS_RE, "")
+  let out = stripHtmlElementBlocks(html, BOILERPLATE_INERT_TAGS)
     .replace(/<input\b[^>]*>/gi, "");
 
   const openTagRe = /<([a-z][\w:-]*)\b([^>]*)>/gi;
