@@ -105,7 +105,7 @@ test("search: named sources in the query select a matching profile", () => {
 
   const { opts, notes } = applyAutoSearchSourcePreset({ query: "reddit thoughts on wrangler" });
   assert.equal(opts.auto_source_preset, "reddit");
-  assert.ok(opts.search_domain_filter.includes("reddit.com"));
+  assert.deepEqual(opts.search_domain_filter, ["reddit.com"]);
   assert.ok(notes.length > 0);
 });
 

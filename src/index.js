@@ -417,12 +417,12 @@ const HTML_ENTITIES = [
   [/&#39;|&apos;/g, "'"],
 ];
 
+/** @type {Array<[RegExp, string]>} */
 const BASE_STRUCTURAL_PATTERNS = [
-  [/<script[\s\S]*?<\/script>/gi, ""],
-  [/<style[\s\S]*?<\/style>/gi, ""],
   [/<!--[\s\S]*?-->/g, ""],
 ];
 
+/** @type {Array<[RegExp, string]>} */
 const BALANCED_STRUCTURAL_PATTERNS = [
   ...BASE_STRUCTURAL_PATTERNS,
   [/<noscript[\s\S]*?<\/noscript>/gi, ""],
@@ -438,6 +438,7 @@ const BALANCED_STRUCTURAL_PATTERNS = [
   [/<(nav|footer|aside|header)[\s\S]*?<\/\1>/gi, ""],
 ];
 
+/** @type {Array<[RegExp, string]>} */
 const STRICT_STRUCTURAL_PATTERNS = [
   ...BALANCED_STRUCTURAL_PATTERNS,
   [/<dialog[\s\S]*?<\/dialog>/gi, ""],
@@ -480,6 +481,52 @@ function decodeEntities(s) {
 
 function normalizeCleaningMode(mode) {
   return CLEANING_MODES.includes(mode) ? mode : "balanced";
+}
+
+function findHtmlTagStart(lower, tagName, fromIndex) {
+  const marker = `<${tagName}`;
+  let index = lower.indexOf(marker, fromIndex);
+  while (index >= 0) {
+    const boundary = lower[index + marker.length] || "";
+    if (!boundary || /[\s/>]/.test(boundary)) return index;
+    index = lower.indexOf(marker, index + marker.length);
+  }
+  return -1;
+}
+
+function findHtmlTagEnd(lower, tagName, fromIndex) {
+  const marker = `</${tagName}`;
+  let index = lower.indexOf(marker, fromIndex);
+  while (index >= 0) {
+    const boundary = lower[index + marker.length] || "";
+    if (!boundary || /[\s>]/.test(boundary)) {
+      const end = lower.indexOf(">", index + marker.length);
+      return end >= 0 ? end + 1 : -1;
+    }
+    index = lower.indexOf(marker, index + marker.length);
+  }
+  return -1;
+}
+
+function stripRawTextElements(value) {
+  const source = String(value || "");
+  const lower = source.toLowerCase();
+  let output = "";
+  let cursor = 0;
+  while (cursor < source.length) {
+    const scriptStart = findHtmlTagStart(lower, "script", cursor);
+    const styleStart = findHtmlTagStart(lower, "style", cursor);
+    const starts = [scriptStart, styleStart].filter((index) => index >= 0);
+    if (!starts.length) break;
+    const start = Math.min(...starts);
+    const tagName = start === scriptStart ? "script" : "style";
+    const openEnd = lower.indexOf(">", start + tagName.length + 1);
+    if (openEnd < 0) break;
+    const closeEnd = findHtmlTagEnd(lower, tagName, openEnd + 1);
+    output += source.slice(cursor, start);
+    cursor = closeEnd >= 0 ? closeEnd : openEnd + 1;
+  }
+  return output + source.slice(cursor);
 }
 
 function structuralPatternsForMode(mode) {
@@ -587,7 +634,7 @@ function extractLinksFromMarkdown(text, baseUrl = "", limit = 80) {
 }
 
 function htmlToText(html, mode = "balanced", opts = {}) {
-  let out = html;
+  let out = stripRawTextElements(html);
   for (const [re, rep] of structuralPatternsForMode(mode)) out = out.replace(re, rep);
   out = htmlLinksToMarkdown(out, opts);
   out = out.replace(/<br\s*\/?>/gi, "\n");
@@ -667,7 +714,7 @@ function extractMetadata(html) {
   meta.siteName = findMetaContent(html, ["og:site_name", "application-name"]);
   meta.type = findMetaContent(html, ["og:type"]);
 
-  const jsonLdMatches = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  const jsonLdMatches = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script\s*>/gi)];
   if (jsonLdMatches.length) {
     const parts = [];
     for (const m of jsonLdMatches) {
@@ -720,9 +767,7 @@ function parseAttributes(raw) {
 
 function fragmentToText(html) {
   return decodeEntities(
-    html
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<style[\s\S]*?<\/style>/gi, "")
+    stripRawTextElements(html)
       .replace(/<[^>]+>/g, " ")
   ).replace(/\s+/g, " ").trim();
 }
@@ -1248,7 +1293,6 @@ function looksBlocked(status, body, pageUrl = "") {
     /(g-recaptcha|hcaptcha|cf-turnstile|data-sitekey|solve captcha|enter the characters|captcha[^<]{0,80}(challenge|required|verify|verification))/i.test(lower) ||
     lower.includes("dcinside.pandalive.co.kr") ||
     lower.includes("/auth/login") ||
-    lower.includes("msign.dcinside.com") ||
     /reddit[^<]{0,40}(verification|please wait)/i.test(lower)
   );
 }
@@ -1574,7 +1618,7 @@ const ARTICLE_CONTAINER_TAGS = ["article", "main", "body"];
 // Tag names that are chrome regardless of their attributes (news pages only).
 const NEWS_NOISE_TAGS_RE = /^(aside|nav|footer|header|figure|figcaption)$/i;
 // Elements that never contribute text and can go before any attribute analysis.
-const BOILERPLATE_INERT_TAGS_RE = /<(script|style|noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1>/gi;
+const BOILERPLATE_INERT_TAGS_RE = /<(noscript|iframe|svg|canvas|form|button|select|textarea)\b[\s\S]*?<\/\1\s*>/gi;
 // Defensive stop only; real pages never approach it.
 const BOILERPLATE_MAX_REMOVALS = 5000;
 
@@ -1592,7 +1636,7 @@ const BOILERPLATE_MAX_REMOVALS = 5000;
  * @param {{ attrPattern: RegExp, keepTags?: string[], noiseTagPattern?: RegExp|null, includeAriaLabel?: boolean }} options
  */
 function stripBoilerplateElements(html, { attrPattern, keepTags = [], noiseTagPattern = null, includeAriaLabel = false }) {
-  let out = String(html || "")
+  let out = stripRawTextElements(html)
     .replace(BOILERPLATE_INERT_TAGS_RE, "")
     .replace(/<input\b[^>]*>/gi, "");
 
@@ -1755,9 +1799,8 @@ function extractDcinsideArticleData(url, html, mode = "balanced", opts = {}) {
     textByClass(html, "gall_reply_num"),
     textByClass(html, "gall_comment"),
   ].filter(Boolean).join(" ");
-  const articleHtml = bodyHtml
-    .replace(/<div\b[^>]*id=["'](?:ad_nv_slot|zzbang_div)["'][\s\S]*?<\/div>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "");
+  const articleHtml = stripRawTextElements(bodyHtml)
+    .replace(/<div\b[^>]*id=["'](?:ad_nv_slot|zzbang_div)["'][\s\S]*?<\/div\s*>/gi, "");
   let articleText = htmlToText(articleHtml, mode, { include_links: opts.include_links !== false, base_url: url });
   // Image-centric posts have almost no body text — keep them instead of
   // discarding (which would drop to noisy generic extraction). Only bail
@@ -2766,7 +2809,7 @@ function plainNewsText(value, mode = "balanced", opts = {}) {
 }
 
 function extractNewsJsonLdData(html, mode = "balanced", opts = {}) {
-  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script\s*>/gi)];
   for (const script of scripts) {
     let parsed;
     const raw = script[1].trim();

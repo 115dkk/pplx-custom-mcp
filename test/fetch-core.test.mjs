@@ -167,6 +167,16 @@ test("core: cleaning modes are normalised and strict removes more chrome", () =>
   assert.ok(strict.length < noisy.length, "strict mode removed nothing");
 });
 
+test("security: script and style blocks with spaced closing tags stay out of extracted text", () => {
+  const text = htmlToText(
+    "<main><p>Keep this sentence.</p><script>steal()</script ><style>.secret{}</style ><p>Keep this too.</p></main>",
+    "balanced"
+  );
+  assert.match(text, /Keep this sentence/);
+  assert.match(text, /Keep this too/);
+  assert.doesNotMatch(text, /steal|secret/);
+});
+
 test("core: body text is extracted and interface noise is dropped", () => {
   const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: true, base_url: URL_ARTICLE });
   assert.match(text, BODY_SENTENCE);
@@ -183,14 +193,14 @@ test("core: links are preserved as markdown and resolved against the base URL", 
   assert.match(text, /\[migration writeup\]\(<https:\/\/example\.com\/blog\/migration-notes>\)/);
 
   const links = extractLinksFromMarkdown(text, URL_ARTICLE);
-  const urls = links.map((l) => l.url);
-  assert.ok(urls.includes("https://example.com/blog/migration-notes"), "absolute link lost");
-  assert.ok(urls.includes("https://example.com/repo"), "relative link was not resolved");
+  const urls = new Set(links.map((l) => l.url));
+  assert.ok(urls.has("https://example.com/blog/migration-notes"), "absolute link lost");
+  assert.ok(urls.has("https://example.com/repo"), "relative link was not resolved");
 });
 
 test("core: include_links=false drops URLs but keeps the sentence", () => {
   const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: false, base_url: URL_ARTICLE });
-  assert.doesNotMatch(text, /https:\/\/example\.com\/blog\/migration-notes/);
+  assert.deepEqual(extractLinksFromMarkdown(text, URL_ARTICLE), []);
   assert.match(text, /migration writeup/, "link label should remain in the prose");
 });
 

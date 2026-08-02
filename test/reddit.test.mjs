@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
   extractRedditPostData,
+  extractLinksFromMarkdown,
   buildRedditJsonUrl,
   looksBlocked,
   resolveSitePreset,
@@ -80,7 +81,7 @@ test("reddit: markdown links in the body are preserved by default and droppable"
   assert.match(withLinks.text, /\[writeup\]\(https:\/\/example\.com\/writeup\)/);
 
   const withoutLinks = extractRedditPostData(POST_URL, POST_JSON, { include_links: false });
-  assert.doesNotMatch(withoutLinks.text, /https:\/\/example\.com\/writeup/);
+  assert.deepEqual(extractLinksFromMarkdown(withoutLinks.text, POST_URL), []);
   assert.match(withoutLinks.text, /writeup/, "link text should survive even when the URL is dropped");
 });
 
