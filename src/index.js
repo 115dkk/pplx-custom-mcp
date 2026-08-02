@@ -2773,13 +2773,55 @@ function extractNewsArticleData(url, html, mode = "balanced", opts = {}) {
   };
 }
 
+// ── Site extractor registry ─────────────────────────────────────────
+// Exactly one preset is active per fetch, so the old code — six ternaries
+// producing six variables, then OR-chains over all of them for text, meta,
+// structured and source — was five parallel copies of a single lookup. Adding
+// a site meant editing all five, and missing one failed silently.
+//
+// "source" is the label reported back to the caller: it names the transport
+// that produced the body, so presets served by an ordinary HTML fetch stay
+// "direct" and only genuinely different paths get their own name.
+const SITE_EXTRACTORS = {
+  reddit: {
+    source: "reddit-json",
+    extract: (url, body, mode, opts) => extractRedditPostData(url, body, opts),
+  },
+  namu: {
+    source: "direct",
+    extract: (url, body, mode, opts) => extractNamuWikiData(url, body, mode, opts),
+  },
+  mediawiki: {
+    source: "mediawiki",
+    extract: (url, body, mode, opts) => extractMediaWikiArticleData(url, body, mode, opts),
+  },
+  sage: {
+    source: "sage",
+    extract: (url, body, mode, opts) => extractSageArticleData(url, body, mode, opts),
+  },
+  news: {
+    source: "news",
+    extract: (url, body, mode, opts) => extractNewsArticleData(url, body, mode, opts),
+  },
+  dcinside: {
+    source: "direct",
+    extract: (url, body, mode, opts) => extractDcinsideArticleData(url, body, mode, opts),
+  },
+};
+
+// Run the extractor registered for this preset, if any.
+function extractSitePage(url, html, preset, mode, opts) {
+  const handler = SITE_EXTRACTORS[preset];
+  if (!handler) return null;
+  const page = handler.extract(url, html, mode, opts);
+  return page ? { ...page, source: handler.source } : null;
+}
+
 function extractSiteStructuredData(url, html, text, meta, preset) {
-  if (preset === "reddit") return extractRedditPostData(url, html)?.structured || null;
-  if (preset === "namu") return extractNamuWikiData(url, html, "balanced")?.structured || null;
-  if (preset === "mediawiki") return extractMediaWikiArticleData(url, html, "balanced")?.structured || null;
-  if (preset === "sage") return extractSageArticleData(url, html, "balanced")?.structured || null;
-  if (preset === "news") return extractNewsArticleData(url, html, "balanced")?.structured || null;
-  if (preset === "dcinside") return extractDcinsideArticleData(url, html, "balanced")?.structured || null;
+  // Only reached when the preset's own extractor returned nothing, in which
+  // case re-running that extractor here would return nothing either. Steam is
+  // the exception: it has no text extractor, only structured fields lifted
+  // off the page.
   return extractSteamStoreData(url, html, text, meta);
 }
 
@@ -3132,24 +3174,13 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
       }
 
       if (status >= 200 && status < 300 && body) {
-        const redditPost = normalizedOpts.site_preset === "reddit"
-          ? extractRedditPostData(lastFinalUrl, body, normalizedOpts)
-          : null;
-        const namuArticle = normalizedOpts.site_preset === "namu"
-          ? extractNamuWikiData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts)
-          : null;
-        const mediaWikiArticle = normalizedOpts.site_preset === "mediawiki"
-          ? extractMediaWikiArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts)
-          : null;
-        const sageArticle = normalizedOpts.site_preset === "sage"
-          ? extractSageArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts)
-          : null;
-        const newsArticle = normalizedOpts.site_preset === "news"
-          ? extractNewsArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts)
-          : null;
-        const dcinsideArticle = normalizedOpts.site_preset === "dcinside"
-          ? extractDcinsideArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts)
-          : null;
+        const sitePage = extractSitePage(
+          lastFinalUrl,
+          body,
+          normalizedOpts.site_preset,
+          normalizedOpts.cleaning_mode,
+          normalizedOpts
+        );
         // DCinside comments are XHR-loaded. Fetch them for any DCinside post,
         // independent of whether article-body extraction succeeded (image-only
         // posts often yield no article body but still have a comment thread).
@@ -3161,19 +3192,22 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
             warnings.push(`디시 댓글 로드 실패: ${String(err).slice(0, 160)}`);
           }
         }
-        let text = redditPost?.text || namuArticle?.text || mediaWikiArticle?.text || sageArticle?.text || newsArticle?.text || dcinsideArticle?.text || htmlToText(body, normalizedOpts.cleaning_mode, { include_links: normalizedOpts.include_links, base_url: lastFinalUrl });
+        let text = sitePage?.text
+          || htmlToText(body, normalizedOpts.cleaning_mode, { include_links: normalizedOpts.include_links, base_url: lastFinalUrl });
         if (dcComments) {
           const commentBlock = formatDcinsideComments(dcComments);
           if (commentBlock) text = `${text}\n\n${commentBlock}`;
         }
-        if (redditPost || namuArticle || mediaWikiArticle || sageArticle || newsArticle || dcinsideArticle || dcComments || hasMeaningfulHtmlContent(body, text)) {
-          // Optimization B: extract meta once here so the tool handler can reuse it.
-          const meta = redditPost?.meta || mediaWikiArticle?.meta || sageArticle?.meta || newsArticle?.meta || extractMetadata(body);
-          if (namuArticle?.structured?.title && !meta.title) meta.title = namuArticle.structured.title;
-          if (dcinsideArticle?.structured?.title && !meta.title) meta.title = dcinsideArticle.structured.title;
-          if (dcinsideArticle?.structured?.author && !meta.author) meta.author = dcinsideArticle.structured.author;
-          if (dcinsideArticle?.structured?.published && !meta.published) meta.published = dcinsideArticle.structured.published;
-          let structured = redditPost?.structured || namuArticle?.structured || mediaWikiArticle?.structured || sageArticle?.structured || newsArticle?.structured || dcinsideArticle?.structured || extractSiteStructuredData(lastFinalUrl, body, text, meta, normalizedOpts.site_preset);
+        if (sitePage || dcComments || hasMeaningfulHtmlContent(body, text)) {
+          // Extract meta once here so the tool handler can reuse it.
+          const meta = sitePage?.meta || extractMetadata(body);
+          // Extractors that report no meta of their own (namu, dcinside) still
+          // carry these fields in structured output; fill the gaps.
+          for (const field of ["title", "author", "published"]) {
+            if (!meta[field] && sitePage?.structured?.[field]) meta[field] = sitePage.structured[field];
+          }
+          let structured = sitePage?.structured
+            || extractSiteStructuredData(lastFinalUrl, body, text, meta, normalizedOpts.site_preset);
           if (dcComments) {
             structured = { ...(structured || {}), comment_count: dcComments.total, comments: dcComments.items };
           }
@@ -3184,7 +3218,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
             status,
             attempt: i + 1,
             warnings,
-            source: redditPost ? "reddit-json" : mediaWikiArticle ? "mediawiki" : sageArticle ? "sage" : newsArticle ? "news" : "direct",
+            source: sitePage?.source || "direct",
             meta,
             finalUrl: lastFinalUrl,
             contentType,
@@ -4295,6 +4329,8 @@ export {
   dedupeNewsBodyAgainstTitle,
   extractSteamStoreData,
   extractSiteStructuredData,
+  extractSitePage,
+  SITE_EXTRACTORS,
   // DCinside comments
   extractDcinsideEsno,
   dcinsideCommentMemoToText,
