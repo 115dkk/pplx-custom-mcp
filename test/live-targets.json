@@ -35,9 +35,17 @@
     {
       "name": "namuwiki via blocked-site fallback",
       "url": "https://namu.wiki/w/나무위키",
-      "min_body_chars": 300,
-      "expect_source": ["direct", "perplexity"],
+      "min_body_chars": 3000,
+      "expect_source": ["direct", "agent-fetch-url", "perplexity"],
       "must_contain": []
+    },
+    {
+      "//": "SourceForge blocks our egress on both HTML and its Allura REST endpoint. It is readable only through the Agent API fetch_url step, so this target proves that step is alive.",
+      "name": "sourceforge via agent fetch_url",
+      "url": "https://sourceforge.net/p/mingw/wiki/Home/",
+      "min_body_chars": 500,
+      "expect_source": ["direct", "sourceforge-allura", "agent-fetch-url"],
+      "must_contain": ["MinGW"]
     }
   ],
   "//optional": "Entries with a blank url are skipped, not failed. Paste a current DCinside post here when you want to verify comment loading against the live site.",
