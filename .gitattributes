@@ -1,0 +1,6 @@
+# Fixtures are compared byte-for-byte by the test suite; keep line endings
+# identical on every platform.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.gif binary

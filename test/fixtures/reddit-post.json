@@ -1,0 +1,75 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "id": "1abcdef",
+            "name": "t3_1abcdef",
+            "subreddit": "programming",
+            "subreddit_name_prefixed": "r/programming",
+            "title": "I replaced a headless browser with 400 lines of fetch logic",
+            "selftext": "We were running Puppeteer just to scrape a handful of pages.\n\nAfter watching the network tab, most of the \"JS-only\" content was a single XHR away. Replicating those calls cut our p95 from 9s to 380ms and let the whole thing run on a free Worker.\n\nDetails in the [writeup](https://example.com/writeup).",
+            "author": "quietcompiler",
+            "score": 1842,
+            "num_comments": 233,
+            "upvote_ratio": 0.94,
+            "created_utc": 1785000000,
+            "permalink": "/r/programming/comments/1abcdef/i_replaced_a_headless_browser/",
+            "is_self": true,
+            "url": "https://www.reddit.com/r/programming/comments/1abcdef/i_replaced_a_headless_browser/"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "author": "netgazer",
+            "score": 311,
+            "created_utc": 1785001000,
+            "body": "This works until the site rotates its token format. Ask me how I know.",
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "author": "quietcompiler",
+                      "score": 128,
+                      "created_utc": 1785001500,
+                      "body": "Fair. We pin the token extraction to three separate regexes and fall back to the desktop page.",
+                      "replies": ""
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "author": "ghostuser",
+            "score": 4,
+            "created_utc": 1785002000,
+            "body": "[deleted]",
+            "replies": ""
+          }
+        },
+        {
+          "kind": "more",
+          "data": { "count": 230 }
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,26 @@
+{
+  "results": [
+    {
+      "title": "I replaced a headless browser with 400 lines of fetch logic",
+      "url": "https://www.reddit.com/r/programming/comments/1abcdef/i_replaced_a_headless_browser/",
+      "snippet": "Most of the JavaScript-only content turned out to be a single documented XHR away, so replaying that request removed the browser entirely.",
+      "date": "2026-06-18",
+      "last_updated": "2026-06-20"
+    },
+    {
+      "title": "I replaced a headless browser with 400 lines of fetch logic (duplicate)",
+      "url": "https://reddit.com/r/programming/comments/1abcdef/i_replaced_a_headless_browser",
+      "snippet": "Mirror of the same thread.",
+      "date": "2026-06-18"
+    },
+    {
+      "title": "Serverless scraping without a browser",
+      "url": "https://example.com/blog/no-headless",
+      "snippet": "A postmortem on replacing Puppeteer with replayed XHR calls."
+    },
+    {
+      "title": "Short note",
+      "url": "https://example.org/note"
+    }
+  ]
+}

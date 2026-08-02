@@ -1,0 +1,37 @@
+name: Live smoke
+
+# Hits the deployed Worker against real sites. Catches site redesigns that the
+# offline fixture suite cannot see. Deliberately NOT part of the deploy gate:
+# a site changing its markup is drift, not a code regression.
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # 03:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Fetch real pages through the deployed Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+
+      - name: Require WORKER_URL
+        run: |
+          if [ -z "${{ vars.WORKER_URL }}" ]; then
+            echo "::error::Repository variable WORKER_URL is not set (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          fi
+
+      - name: Run live smoke
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+        run: node scripts/live-smoke.mjs

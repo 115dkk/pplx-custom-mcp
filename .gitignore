@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+dist/
+coverage/
+
+# Local secrets — never commit
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

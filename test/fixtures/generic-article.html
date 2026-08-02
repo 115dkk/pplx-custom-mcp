@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Why we stopped shipping a headless browser</title>
+<meta name="description" content="A postmortem on replacing Puppeteer with replayed XHR calls.">
+<meta property="og:site_name" content="Example Engineering">
+<meta name="author" content="J. Rivera">
+<meta property="article:published_time" content="2026-06-18T10:00:00Z">
+<link rel="canonical" href="https://example.com/blog/no-headless">
+</head>
+<body>
+<nav><a href="/">Home</a> <a href="/blog">Blog</a></nav>
+<article>
+  <h1>Why we stopped shipping a headless browser</h1>
+  <p>Our scraper spent most of its runtime waiting for a browser to boot, and almost none of it reading the page we actually wanted.</p>
+  <p>The content we called "JavaScript-only" was, in nearly every case, one documented XHR away. Replaying that request directly removed the browser from the critical path entirely.</p>
+  <p>The full migration notes are in the <a href="https://example.com/blog/migration-notes">migration writeup</a>, and the benchmark harness lives in the <a href="/repo">repository</a>.</p>
+  <p>Cookie consent and newsletter prompts are not part of the article and should never appear in extracted text.</p>
+</article>
+<div class="cookie-banner">We use cookies. Accept</div>
+<footer>Subscribe</footer>
+</body>
+</html>

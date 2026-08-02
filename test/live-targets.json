@@ -1,0 +1,25 @@
+{
+  "//": "Targets for the live smoke run (scripts/live-smoke.mjs). These hit the real internet through the deployed Worker, so they catch site redesigns that fixture tests cannot. Only long-lived URLs belong here — forum posts and news articles rot within weeks. Add a current DCinside post under `optional` when you want to verify comment loading against the live site; a missing/blank entry is skipped, not failed.",
+  "targets": [
+    {
+      "name": "steam store page",
+      "url": "https://store.steampowered.com/app/440/",
+      "min_body_chars": 400,
+      "must_contain": ["Team Fortress"]
+    },
+    {
+      "name": "namuwiki article",
+      "url": "https://namu.wiki/w/나무위키",
+      "min_body_chars": 800,
+      "must_contain": []
+    }
+  ],
+  "optional": [
+    {
+      "name": "dcinside post with comments",
+      "url": "",
+      "min_body_chars": 50,
+      "must_contain": ["## 댓글"]
+    }
+  ]
+}

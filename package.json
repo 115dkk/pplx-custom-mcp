@@ -1,0 +1,28 @@
+{
+  "name": "perplexity-custom-mcp",
+  "version": "1.2.0",
+  "description": "Cloudflare Workers MCP server: Perplexity search plus a no-JS page fetcher",
+  "type": "module",
+  "main": "src/worker.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "typecheck": "tsc --noEmit -p jsconfig.json",
+    "check": "npm run test && npm run typecheck",
+    "smoke": "node scripts/live-smoke.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.28.0",
+    "agents": "^0.8.7",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.85.0"
+  }
+}

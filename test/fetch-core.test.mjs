@@ -1,0 +1,201 @@
+// Site-agnostic fetch behaviour: body extraction, link preservation, cleaning
+// modes, pagination, metadata triage, client-side redirects, and the fallbacks
+// that keep a blocked or JS-only page from returning nothing at all.
+
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  fetchAndFormat,
+  fetchPageWithFallbacks,
+  formatFetchResult,
+  buildFetchStructured,
+  extractMetadata,
+  extractClientRedirect,
+  extractLinksFromMarkdown,
+  htmlToText,
+  cleanText,
+  paginateText,
+  normalizeCleaningMode,
+  isDocumentUrl,
+  hasMeaningfulHtmlContent,
+} from "../src/index.js";
+import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
+
+const URL_ARTICLE = "https://example.com/blog/no-headless";
+const ARTICLE_HTML = fixture("generic-article.html");
+const SPA_HTML = fixture("spa-shell.html");
+
+const BODY_SENTENCE = /almost none of it reading the page/;
+
+test("core: metadata is lifted from head tags", () => {
+  const meta = extractMetadata(ARTICLE_HTML);
+  assert.equal(meta.title, "Why we stopped shipping a headless browser");
+  assert.match(meta.description, /replacing Puppeteer/);
+  assert.equal(meta.canonical, "https://example.com/blog/no-headless");
+  assert.equal(meta.author, "J. Rivera");
+  assert.equal(meta.published, "2026-06-18T10:00:00Z");
+  assert.equal(meta.siteName, "Example Engineering");
+});
+
+test("core: cleaning modes are normalised and strict removes more chrome", () => {
+  assert.equal(normalizeCleaningMode(undefined), "balanced");
+  assert.equal(normalizeCleaningMode("nonsense"), "balanced");
+  assert.equal(normalizeCleaningMode("strict"), "strict");
+
+  const noisy = "Accept all cookies\nSubscribe to our newsletter\nThis paragraph is the actual article content and must always survive cleaning.";
+  const strict = cleanText(noisy, "strict");
+  assert.match(strict, /actual article content/);
+  assert.ok(strict.length < noisy.length, "strict mode removed nothing");
+});
+
+test("core: body text is extracted and interface noise is dropped", () => {
+  const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: true, base_url: URL_ARTICLE });
+  assert.match(text, BODY_SENTENCE);
+  assert.match(text, /one documented XHR away/);
+  assert.doesNotMatch(text, /We use cookies/, "cookie banner leaked into the body");
+});
+
+test("core: links are preserved as markdown and resolved against the base URL", () => {
+  const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: true, base_url: URL_ARTICLE });
+
+  // Regression: tag stripping used to swallow the angle-bracketed href and
+  // leave `[label]( )`, silently dropping every URL on every HTML page.
+  assert.doesNotMatch(text, /\]\(\s*\)/, "link href was stripped out of the markdown");
+  assert.match(text, /\[migration writeup\]\(<https:\/\/example\.com\/blog\/migration-notes>\)/);
+
+  const links = extractLinksFromMarkdown(text, URL_ARTICLE);
+  const urls = links.map((l) => l.url);
+  assert.ok(urls.includes("https://example.com/blog/migration-notes"), "absolute link lost");
+  assert.ok(urls.includes("https://example.com/repo"), "relative link was not resolved");
+});
+
+test("core: include_links=false drops URLs but keeps the sentence", () => {
+  const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: false, base_url: URL_ARTICLE });
+  assert.doesNotMatch(text, /https:\/\/example\.com\/blog\/migration-notes/);
+  assert.match(text, /migration writeup/, "link label should remain in the prose");
+});
+
+test("core: pagination splits a long body and advertises the next page", () => {
+  const body = Array.from({ length: 40 }, (_, i) => `Paragraph ${i + 1} of the long document body.`).join("\n\n");
+  const first = paginateText(body, 400, 1);
+  assert.equal(first.page, 1);
+  assert.ok(first.totalPages > 1, "long body was not split");
+  assert.equal(first.hasNext, true);
+  assert.ok(first.text.length <= 400);
+
+  const second = paginateText(body, 400, 2);
+  assert.equal(second.page, 2);
+  assert.notEqual(second.text, first.text, "page 2 repeated page 1");
+
+  const beyond = paginateText(body, 400, 999);
+  assert.equal(beyond.outOfRange, true);
+});
+
+test("core: end-to-end fetch returns body, header, and links block", async () => {
+  const stub = installFetch([{ url: URL_ARTICLE, body: ARTICLE_HTML }]);
+  try {
+    const { result, text } = await fetchAndFormat(URL_ARTICLE, "", OFFLINE);
+    assert.equal(result.ok, true);
+    assert.equal(result.status, 200);
+    assert.match(text, BODY_SENTENCE, "article body missing from tool output");
+    assert.match(text, /^URL: https:\/\/example\.com\/blog\/no-headless$/m);
+    assert.match(text, /Title: Why we stopped shipping a headless browser/);
+    assert.match(text, /Links found \(\d+/);
+    assert.match(text, /Citation rule:/);
+
+    const structured = buildFetchStructured(URL_ARTICLE, result, text, OFFLINE);
+    assert.match(structured.result.text, BODY_SENTENCE, "structuredContent body is empty");
+    assert.equal(structured.result.status, 200);
+    assert.ok(structured.result.links.length >= 2);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("core: metadata_only returns metadata without the body", async () => {
+  const stub = installFetch([{ url: URL_ARTICLE, body: ARTICLE_HTML }]);
+  try {
+    const result = await fetchPageWithFallbacks(URL_ARTICLE, "", OFFLINE);
+    const text = formatFetchResult(URL_ARTICLE, result, { ...OFFLINE, metadata_only: true });
+    assert.match(text, /Metadata:/);
+    assert.match(text, /Why we stopped shipping a headless browser/);
+    assert.doesNotMatch(text, BODY_SENTENCE, "metadata_only should not include the body");
+
+    const structured = buildFetchStructured(URL_ARTICLE, result, text, { ...OFFLINE, metadata_only: true });
+    assert.equal(structured.result.text, "");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("core: client-side meta refresh redirects are detected and followed", async () => {
+  const HOP = "https://example.com/go?to=blog";
+  const redirectHtml = `<html><head><meta http-equiv="refresh" content="0; url=https://example.com/blog/no-headless"></head><body>redirecting</body></html>`;
+
+  assert.deepEqual(extractClientRedirect(HOP, redirectHtml), { url: URL_ARTICLE, kind: "meta-refresh" });
+
+  const stub = installFetch([
+    { url: URL_ARTICLE, body: ARTICLE_HTML },
+    { url: HOP, body: redirectHtml },
+  ]);
+  try {
+    const { result, text } = await fetchAndFormat(HOP, "", OFFLINE);
+    assert.equal(result.ok, true);
+    assert.match(text, BODY_SENTENCE, "redirect target body missing from tool output");
+    assert.equal(result.finalUrl, URL_ARTICLE);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("core: a JS-only shell degrades to metadata instead of returning nothing", async () => {
+  const SPA_URL = "https://spa.example.com/report";
+  const stub = installFetch([{ url: SPA_URL, body: SPA_HTML }]);
+  try {
+    // No API key, so the Perplexity fallback is skipped and metadata is the floor.
+    const { result, text } = await fetchAndFormat(SPA_URL, "", OFFLINE);
+    assert.equal(result.ok, true);
+    assert.match(text, /Quarterly platform report/);
+    assert.match(text, /Latency dropped 42 percent/, "og:description fallback missing");
+    assert.match(text, /메타데이터만 추출/, "the degraded-extraction warning should be visible");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("core: SPA shells are recognised, real articles are not", () => {
+  assert.equal(hasMeaningfulHtmlContent(SPA_HTML, htmlToText(SPA_HTML)), false);
+  assert.equal(hasMeaningfulHtmlContent(ARTICLE_HTML, htmlToText(ARTICLE_HTML)), true);
+});
+
+test("core: document URLs are flagged rather than returned as garbled text", async () => {
+  const PDF_URL = "https://example.com/papers/report.pdf";
+  assert.equal(isDocumentUrl(PDF_URL), true);
+  assert.equal(isDocumentUrl(URL_ARTICLE), false);
+
+  const stub = installFetch([
+    { url: PDF_URL, body: "%PDF-1.7 binary", headers: { "content-type": "application/pdf" } },
+  ]);
+  try {
+    const { result, text } = await fetchAndFormat(PDF_URL, "", OFFLINE);
+    assert.equal(result.source, "document");
+    assert.match(text, /Document URL detected/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("core: an unreachable host fails loudly instead of returning a fake body", async () => {
+  const DEAD = "https://dead.example.com/page";
+  const stub = installFetch([
+    { url: DEAD, body: () => { throw new Error("ECONNREFUSED"); } },
+  ]);
+  try {
+    const { result } = await fetchAndFormat(DEAD, "", OFFLINE);
+    assert.equal(result.ok, false);
+    assert.ok((result.warnings || []).length > 0, "failure should be reported in warnings");
+  } finally {
+    stub.restore();
+  }
+});
