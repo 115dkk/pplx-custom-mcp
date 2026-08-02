@@ -3015,6 +3015,11 @@ function degradationCause(flags) {
 }
 
 const DEGRADATION_TEXT = {
+  agentFetch: {
+    steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
+    blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
+    shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
+  },
   perplexity: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
@@ -3107,29 +3112,47 @@ async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
   }
 }
 
+// Both remote fallbacks in priority order: fetch the actual page first, and
+// only search for it if fetching is refused (robots disallow still leaves the
+// page indexed, so search can succeed where fetch_url cannot).
+// Returns { text, source } or null.
+async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
+  if (!apiKey) return null;
+
+  try {
+    const agent = await fetchViaAgentUrlTool(url, maxChars, apiKey);
+    if (agent.text) return { text: agent.text, source: "agent-fetch-url" };
+    if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
+  } catch (err) {
+    warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
+  }
+
+  try {
+    const searched = await fetchViaPerplexity(url, maxChars, apiKey);
+    if (searched) return { text: searched, source: "perplexity" };
+  } catch (err) {
+    warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
+  }
+  return null;
+}
+
 // Every direct attempt is spent. Walk the remaining ladder — document handling,
 // the paid Perplexity site: fallback, page metadata — and return whatever still
 // carries information, rather than nothing at all. Caller applies finish().
 async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags }) {
   if (flags.document) {
-    if (apiKey) {
-      try {
-        const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
-        if (pplxText) {
-          return {
-            ok: true,
-            text: `[Document URL detected: direct binary parsing is not available in this Worker. Perplexity domain fallback was used.]\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
-            attempt: attemptTotal + 1,
-            warnings,
-            partial: true,
-            source: "document-perplexity",
-            meta: {},
-            ...lastResponseFields(last),
-          };
-        }
-      } catch (err) {
-        warnings.push(`document fallback failed: ${String(err).slice(0, 200)}`);
-      }
+    const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+    if (remote) {
+      return {
+        ok: true,
+        text: `[Document URL detected: direct binary parsing is not available in this Worker. Perplexity fallback was used.]\n\n${remote.text}`.slice(0, FETCH_MAX_CHARS_LIMIT),
+        attempt: attemptTotal + 1,
+        warnings,
+        partial: true,
+        source: `document-${remote.source}`,
+        meta: {},
+        ...lastResponseFields(last),
+      };
     }
     return {
       ok: false,
@@ -3151,25 +3174,19 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
     : "";
   const cause = degradationCause(flags);
 
-  // Costs ~$0.005 but works on Cloudflare-protected SPAs that pre-render for no UA.
-  if (apiKey) {
-    try {
-      const pplxText = await fetchViaPerplexity(url, FETCH_MAX_CHARS_LIMIT, apiKey);
-      if (pplxText) {
-        return {
-          ok: true,
-          text: `${DEGRADATION_TEXT.perplexity[cause]}\n\n${pplxText}`.slice(0, FETCH_MAX_CHARS_LIMIT),
-          attempt: attemptTotal + 1,
-          warnings,
-          partial: true,
-          source: "perplexity",
-          meta,
-          ...lastResponseFields(last),
-        };
-      }
-    } catch (err) {
-      warnings.push(`Perplexity 폴백 실패: ${String(err).slice(0, 200)}`);
-    }
+  // Paid, but works on Cloudflare-protected SPAs that pre-render for no UA.
+  const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+  if (remote) {
+    return {
+      ok: true,
+      text: `${DEGRADATION_TEXT[remote.source === "agent-fetch-url" ? "agentFetch" : "perplexity"][cause]}\n\n${remote.text}`.slice(0, FETCH_MAX_CHARS_LIMIT),
+      attempt: attemptTotal + 1,
+      warnings,
+      partial: true,
+      source: remote.source,
+      meta,
+      ...lastResponseFields(last),
+    };
   }
 
   if (metaText) {
@@ -3544,6 +3561,54 @@ function isOpaqueSlug(slug) {
     /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(token) ||       // uuid
     (/^[A-Za-z0-9_-]{16,}$/.test(token) && /[a-z]/.test(token) && /[A-Z0-9]/.test(token))
   );
+}
+
+// ── Agent API fetch_url fallback ────────────────────────────────────
+// Perplexity's Agent API can fetch a URL from its own infrastructure and hand
+// back the extracted body. Unlike the search fallback below it retrieves THE
+// requested page rather than searching for something like it, and it returns
+// the full text instead of a snippet.
+//
+// Measured 2026-08-02 (preset "fast" -> openai/gpt-5.4-mini):
+//   blocked/robots-refused page  $0.0030   (no content)
+//   SourceForge wiki, 2 KB body  $0.0025
+//   Wikipedia article, 33 KB     $0.0073
+// versus $0.005 for one Search API request. Cost is dominated by input tokens,
+// so it scales with page size, not with a per-call premium.
+const AGENT_ENDPOINT = "v1/agent";
+const AGENT_PRESET = "fast";
+// The tool reports failure as a sentence inside the snippet, not as an error.
+const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
+
+async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
+  const response = await makeApiRequest(AGENT_ENDPOINT, {
+    preset: AGENT_PRESET,
+    // Keep the instruction short: the body text is read straight off the tool
+    // result, so nothing is gained by having the model repeat it back.
+    input: `Fetch ${url}. Reply with OK.`,
+    tools: [{ type: "fetch_url", max_urls: 1 }],
+  }, apiKey);
+  const data = await response.json();
+
+  const item = (Array.isArray(data?.output) ? data.output : []).find((o) => o?.type === "fetch_url_results");
+  const entry = Array.isArray(item?.contents) ? item.contents[0] : null;
+  const snippet = entry?.snippet ? String(entry.snippet) : "";
+  if (!snippet || AGENT_NO_CONTENT_RE.test(snippet)) {
+    // robots disallow, upstream block, or an empty page — say why if we can.
+    const reason = snippet.match(/—\s*([a-z_]+)\./i)?.[1] || "";
+    return { text: null, reason };
+  }
+  // fetch_url is given our URL, but never assume: a redirect elsewhere is a
+  // different document and must not be presented as this one.
+  if (entry.url && !sameDocument(url, entry.url)) return { text: null, reason: "redirected" };
+
+  const parts = [
+    entry.title ? `# ${cleanText(entry.title)}` : "",
+    `URL (Perplexity fetch_url): ${entry.url || url}`,
+    "",
+    cleanText(snippet),
+  ].filter(Boolean);
+  return { text: parts.join("\n").slice(0, maxChars), reason: "" };
 }
 
 async function fetchViaPerplexity(url, maxChars, apiKey) {
@@ -4535,6 +4600,8 @@ export {
   fetchSourceForgeAllura,
   fetchSageViaPmc,
   fetchViaPerplexity,
+  fetchViaAgentUrlTool,
+  fetchRemoteBody,
   sameDocument,
   isOpaqueSlug,
   runSearch,
