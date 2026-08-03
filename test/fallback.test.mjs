@@ -198,10 +198,10 @@ test("agent: a historical NamuWiki raw URL accepts only the exact rev from eithe
     assert.match(out.text, /정확한 과거판 본문입니다/);
     assert.doesNotMatch(out.text, /현재판이 섞이면/);
     const request = JSON.parse(String(stub.matching("/v1/agent")[0].body));
-    assert.equal(request.model, "openai/gpt-5.4-mini");
+    assert.equal(request.preset, "pro-search");
+    assert.equal(request.model, undefined);
     assert.equal(request.max_steps, 1);
     assert.equal(request.max_output_tokens, 32);
-    assert.equal(request.tool_choice, "required");
     assert.equal(request.tools[0].max_urls, 1);
     assert.ok(!request.input.includes(new URL(REVISION_URL).toString()));
     assert.ok(request.input.includes(exactEnglishRevision));
@@ -257,6 +257,17 @@ test("agent: an empty contents array is a failure, not an empty page", async () 
   const stub = agentStub({ agent: { output: [{ type: "fetch_url_results", contents: null }] }, search: [] });
   try {
     assert.equal(await fetchRemoteBody(ARTICLE_URL, 8000, "pplx-test", []), null);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("agent: a skipped fetch_url call is reported explicitly", async () => {
+  const stub = agentStub({ agent: { output: [{ type: "message" }] }, search: [] });
+  const warnings = [];
+  try {
+    assert.equal(await fetchRemoteBody(ARTICLE_URL, 8000, "pplx-test", warnings), null);
+    assert.ok(warnings.some((warning) => /tool_not_called \(message\)/.test(warning)));
   } finally {
     stub.restore();
   }

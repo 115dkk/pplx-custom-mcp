@@ -1453,8 +1453,9 @@ function namuRemoteDocumentUrls(url) {
       return [readableUrl];
     }
 
+    if (u.hostname === "en.namu.wiki") return [u.toString()];
     const alternate = new URL(u);
-    alternate.hostname = u.hostname === "en.namu.wiki" ? "namu.wiki" : "en.namu.wiki";
+    alternate.hostname = "en.namu.wiki";
     return [...new Set([u.toString(), alternate.toString()])];
   } catch {
     return [readableUrl];
@@ -3430,7 +3431,11 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   const remoteUrls = namuRemoteDocumentUrls(url);
   const readableUrl = remoteUrls[0];
   const agentUrl = remoteUrls.at(-1);
-  if (readableUrl !== url) {
+  let mappedRawRoute = false;
+  try {
+    mappedRawRoute = /^\/raw\//i.test(new URL(url).pathname) && /^\/w\//i.test(new URL(readableUrl).pathname);
+  } catch { /* URL was validated before this path. */ }
+  if (mappedRawRoute) {
     warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
   }
 
@@ -3897,14 +3902,16 @@ function isOpaqueSlug(slug) {
 // requested page rather than searching for something like it, and it returns
 // the full text instead of a snippet.
 //
-// Measured 2026-08-02 (preset "fast" -> openai/gpt-5.4-mini):
+// Measured 2026-08-02 (legacy preset "fast" -> openai/gpt-5.4-mini):
 //   blocked/robots-refused page  $0.0030   (no content)
 //   SourceForge wiki, 2 KB body  $0.0025
 //   Wikipedia article, 33 KB     $0.0073
 // versus $0.005 for one Search API request. Cost is dominated by input tokens,
 // so it scales with page size, not with a per-call premium.
 const AGENT_ENDPOINT = "v1/agent";
-const AGENT_MODEL = "openai/gpt-5.4-mini";
+// "fast" is no longer a documented preset. pro-search is the current official
+// preset that includes fetch_url and a tool-use system prompt.
+const AGENT_PRESET = "pro-search";
 // Measured 11-15 s per call, but a Worker colo saw one run past 30 s. This is
 // an extra step in front of our own fallback, not a replacement for it, so it
 // gets a bounded slice of the budget and hands over on expiry rather than
@@ -3920,14 +3927,9 @@ const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
 
 async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FETCH_TIMEOUT_MS) {
   const response = await makeApiRequest(AGENT_ENDPOINT, {
-    // Pin the model instead of relying on the undocumented legacy "fast"
-    // preset, whose model/tool configuration can change underneath us.
-    model: AGENT_MODEL,
+    preset: AGENT_PRESET,
     max_steps: 1,
     max_output_tokens: 32,
-    // The Agent API otherwise leaves tool use on "auto" and occasionally
-    // returns a message without invoking our only configured tool.
-    tool_choice: "required",
     instructions: "You must call fetch_url exactly once with every URL supplied by the user. Do not search or answer from memory.",
     // The body text is read straight off the tool result, so nothing is gained
     // by having the model repeat it back.
@@ -3936,7 +3938,8 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
   }, apiKey, timeoutMs);
   const data = await response.json();
 
-  const entries = (Array.isArray(data?.output) ? data.output : [])
+  const output = Array.isArray(data?.output) ? data.output : [];
+  const entries = output
     .filter((item) => item?.type === "fetch_url_results")
     .flatMap((item) => Array.isArray(item.contents) ? item.contents : []);
   const entry = entries.find((candidate) => {
@@ -3946,8 +3949,10 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
   if (!entry) {
     // robots disallow, upstream block, or an empty page — say why if we can.
     const failureText = entries.map((candidate) => String(candidate?.snippet || "")).find((snippet) => AGENT_NO_CONTENT_RE.test(snippet)) || "";
+    const outputTypes = [...new Set(output.map((item) => item?.type).filter(Boolean))].join(",");
     const reason = failureText.match(/—\s*([a-z_]+)\./i)?.[1]
-      || (entries.some((candidate) => candidate?.url) ? "redirected" : "");
+      || data?.error?.code
+      || (entries.some((candidate) => candidate?.url) ? "redirected" : `tool_not_called${outputTypes ? ` (${outputTypes})` : ""}`);
     return { text: null, reason };
   }
   const snippet = String(entry.snippet);
