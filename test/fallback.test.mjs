@@ -5,12 +5,32 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { sameDocument, isOpaqueSlug, fetchViaPerplexity, fetchRemoteBody, fetchAndFormat } from "../src/index.js";
+import { sameDocument, isOpaqueSlug, fetchViaPerplexity, fetchRemoteBody, fetchAndFormat, namuReadableDocumentUrl, namuRemoteDocumentUrls } from "../src/index.js";
 import { installFetch, OFFLINE } from "./helpers/harness.mjs";
 
 const API = "https://api.perplexity.ai/search";
 const THREAD_URL = "https://namu.wiki/thread/FunnySulkySpuriousGate";
 const ARTICLE_URL = "https://namu.wiki/w/나무위키";
+const RAW_ARTICLE_URL = "https://namu.wiki/raw/나무위키";
+const RAW_REVISION_URL = `${RAW_ARTICLE_URL}?rev=5161`;
+const REVISION_URL = `${ARTICLE_URL}?rev=5161`;
+const EN_REVISION_URL = "https://en.namu.wiki/w/나무위키?rev=5161";
+
+test("namu: raw URLs have an equivalent readable document URL for remote fallbacks", () => {
+  const normalizedArticleUrl = new URL(ARTICLE_URL).toString();
+  assert.equal(namuReadableDocumentUrl(RAW_ARTICLE_URL), normalizedArticleUrl);
+  assert.equal(namuReadableDocumentUrl(`${RAW_ARTICLE_URL}?rev=123`), `${normalizedArticleUrl}?rev=123`);
+  assert.equal(namuReadableDocumentUrl(ARTICLE_URL), normalizedArticleUrl);
+  assert.equal(namuReadableDocumentUrl("https://example.com/raw/나무위키"), "https://example.com/raw/%EB%82%98%EB%AC%B4%EC%9C%84%ED%82%A4");
+});
+
+test("namu: historical remote candidates preserve the exact revision", () => {
+  assert.deepEqual(namuRemoteDocumentUrls(RAW_REVISION_URL), [
+    new URL(REVISION_URL).toString(),
+    new URL(EN_REVISION_URL).toString(),
+  ]);
+  assert.deepEqual(namuRemoteDocumentUrls(RAW_ARTICLE_URL), [new URL(ARTICLE_URL).toString()]);
+});
 
 function searchStub(results) {
   return installFetch([
@@ -132,6 +152,71 @@ test("agent: a successful fetch_url is preferred and skips the paid search", asy
     assert.equal(out.source, "agent-fetch-url");
     assert.match(out.text, /한국어 위키위키 사이트이다/);
     assert.equal(stub.matching("/search").length, 0, "the search fallback should not have been billed");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("agent: a blocked NamuWiki raw URL is fetched through the equivalent /w/ document", async () => {
+  const stub = agentStub({
+    agent: agentHit(ARTICLE_URL, "나무위키는 한국어 위키위키 사이트이다. ".repeat(8)),
+    search: [{ title: "should not be used", url: ARTICLE_URL, snippet: "search fallback" }],
+  });
+  const warnings = [];
+  try {
+    const out = await fetchRemoteBody(RAW_ARTICLE_URL, 8000, "pplx-test", warnings);
+    assert.ok(out, "the readable document URL was not used");
+    assert.equal(out.source, "agent-fetch-url");
+    const request = JSON.parse(String(stub.matching("/v1/agent")[0].body));
+    assert.match(request.input, new RegExp(encodeURI(ARTICLE_URL)));
+    assert.doesNotMatch(request.input, /\/raw\//);
+    assert.ok(warnings.some((warning) => /정규 \/w\/ URL/.test(warning)));
+    assert.equal(stub.matching("/search").length, 0, "search should not be billed after the canonical fetch succeeds");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("agent: a historical NamuWiki raw URL accepts only the exact rev from either frontend", async () => {
+  const exactEnglishRevision = new URL(EN_REVISION_URL).toString();
+  const stub = agentStub({
+    agent: {
+      output: [{
+        type: "fetch_url_results",
+        contents: [
+          { url: new URL(`${ARTICLE_URL}?rev=5162`).toString(), title: "wrong revision", snippet: "현재판이 섞이면 안 됩니다." },
+          { url: exactEnglishRevision, title: "r5161", snippet: "정확한 과거판 본문입니다. ".repeat(8) },
+        ],
+      }],
+    },
+    search: [],
+  });
+  const warnings = [];
+  try {
+    const out = await fetchRemoteBody(RAW_REVISION_URL, 8000, "pplx-test", warnings);
+    assert.ok(out, "the exact language-frontend revision was not used");
+    assert.match(out.text, /정확한 과거판 본문입니다/);
+    assert.doesNotMatch(out.text, /현재판이 섞이면/);
+    const request = JSON.parse(String(stub.matching("/v1/agent")[0].body));
+    assert.equal(request.model, "openai/gpt-5.4-mini");
+    assert.equal(request.max_steps, 1);
+    assert.equal(request.tools[0].max_urls, 2);
+    assert.ok(request.input.includes(new URL(REVISION_URL).toString()));
+    assert.ok(request.input.includes(exactEnglishRevision));
+    assert.ok(warnings.some((warning) => /같은 rev의 영어/.test(warning)));
+    assert.equal(stub.matching("/search").length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("agent: a historical NamuWiki result without the requested rev is rejected", async () => {
+  const stub = agentStub({
+    agent: agentHit(ARTICLE_URL, "이것은 현재판이므로 과거판 대신 반환되면 안 됩니다."),
+    search: [],
+  });
+  try {
+    assert.equal(await fetchRemoteBody(RAW_REVISION_URL, 8000, "pplx-test", []), null);
   } finally {
     stub.restore();
   }

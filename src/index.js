@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.2.1";
+const VERSION = "1.2.2";
 
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
@@ -1418,6 +1418,45 @@ function isNamuWikiUrl(url) {
     return host === "namu.wiki" || host.endsWith(".namu.wiki");
   } catch {
     return false;
+  }
+}
+
+// NamuWiki's /raw/ route is explicitly refused by some mediated fetchers even
+// when the user requested one document. Our own direct attempt still gets the
+// exact /raw/ URL first and never consults robots.txt. If that attempt is
+// blocked, ask remote fallbacks for the equivalent readable /w/ document
+// instead of letting a route-specific robots rule erase the whole result.
+function namuReadableDocumentUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!isNamuWikiUrl(u.toString())) return u.toString();
+    const match = u.pathname.match(/^\/raw\/(.+)$/i);
+    if (!match) return u.toString();
+    u.pathname = `/w/${match[1]}`;
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+// Historical revisions are unusually fragile: namu.wiki blocks /raw/?rev=
+// outright and may also reject /w/?rev= from a mediated fetcher.  The English
+// NamuWiki frontend exposes the same revision identity, so give fetch_url both
+// exact-revision URLs in one tool call.  sameDocument() below still requires
+// the rev query value to match, preventing a silent fallback to today's page.
+function namuRemoteDocumentUrls(url) {
+  const readableUrl = namuReadableDocumentUrl(url);
+  try {
+    const u = new URL(readableUrl);
+    if (!isNamuWikiUrl(u.toString()) || !/^\/w\//i.test(u.pathname) || !u.searchParams.has("rev")) {
+      return [readableUrl];
+    }
+
+    const alternate = new URL(u);
+    alternate.hostname = u.hostname === "en.namu.wiki" ? "namu.wiki" : "en.namu.wiki";
+    return [...new Set([u.toString(), alternate.toString()])];
+  } catch {
+    return [readableUrl];
   }
 }
 
@@ -3387,10 +3426,20 @@ async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
 // Returns { text, source } or null.
 async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   if (!apiKey) return null;
+  const remoteUrls = namuRemoteDocumentUrls(url);
+  const readableUrl = remoteUrls[0];
+  if (readableUrl !== url) {
+    warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
+  }
 
   try {
-    const agent = await fetchViaAgentUrlTool(url, maxChars, apiKey);
-    if (agent.text) return { text: agent.text, source: "agent-fetch-url" };
+    const agent = await fetchViaAgentUrlTool(readableUrl, maxChars, apiKey, remoteUrls.slice(1));
+    if (agent.text) {
+      if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
+        warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
+      }
+      return { text: agent.text, source: "agent-fetch-url" };
+    }
     if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
   } catch (err) {
     warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
@@ -3398,7 +3447,7 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
 
   // Always reached, whatever happened above.
   try {
-    const searched = await fetchViaPerplexity(url, maxChars, apiKey);
+    const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey);
     if (searched) return { text: searched, source: "perplexity" };
   } catch (err) {
     warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
@@ -3849,7 +3898,7 @@ function isOpaqueSlug(slug) {
 // versus $0.005 for one Search API request. Cost is dominated by input tokens,
 // so it scales with page size, not with a per-call premium.
 const AGENT_ENDPOINT = "v1/agent";
-const AGENT_PRESET = "fast";
+const AGENT_MODEL = "openai/gpt-5.4-mini";
 // Measured 11-15 s per call, but a Worker colo saw one run past 30 s. This is
 // an extra step in front of our own fallback, not a replacement for it, so it
 // gets a bounded slice of the budget and hands over on expiry rather than
@@ -3859,27 +3908,38 @@ const SEARCH_FALLBACK_TIMEOUT_MS = 20_000;
 // The tool reports failure as a sentence inside the snippet, not as an error.
 const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
 
-async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
+async function fetchViaAgentUrlTool(url, maxChars, apiKey, alternateUrls = []) {
+  const urls = [...new Set([url, ...alternateUrls])].slice(0, 3);
+  const urlList = urls.map((candidate) => `- ${candidate}`).join("\n");
   const response = await makeApiRequest(AGENT_ENDPOINT, {
-    preset: AGENT_PRESET,
-    // Keep the instruction short: the body text is read straight off the tool
-    // result, so nothing is gained by having the model repeat it back.
-    input: `Fetch ${url}. Reply with OK.`,
-    tools: [{ type: "fetch_url", max_urls: 1 }],
+    // Pin the model instead of relying on the undocumented legacy "fast"
+    // preset, whose model/tool configuration can change underneath us.
+    model: AGENT_MODEL,
+    max_steps: 1,
+    instructions: "You must call fetch_url exactly once with every URL supplied by the user. Do not search or answer from memory.",
+    // The body text is read straight off the tool result, so nothing is gained
+    // by having the model repeat it back. Historical NamuWiki calls include
+    // both language frontends and are deliberately issued together.
+    input: `Fetch every URL below in one fetch_url call. Reply with OK.\n${urlList}`,
+    tools: [{ type: "fetch_url", max_urls: urls.length }],
   }, apiKey, AGENT_FETCH_TIMEOUT_MS);
   const data = await response.json();
 
-  const item = (Array.isArray(data?.output) ? data.output : []).find((o) => o?.type === "fetch_url_results");
-  const entry = Array.isArray(item?.contents) ? item.contents[0] : null;
-  const snippet = entry?.snippet ? String(entry.snippet) : "";
-  if (!snippet || AGENT_NO_CONTENT_RE.test(snippet)) {
+  const entries = (Array.isArray(data?.output) ? data.output : [])
+    .filter((item) => item?.type === "fetch_url_results")
+    .flatMap((item) => Array.isArray(item.contents) ? item.contents : []);
+  const entry = entries.find((candidate) => {
+    const snippet = candidate?.snippet ? String(candidate.snippet) : "";
+    return snippet && !AGENT_NO_CONTENT_RE.test(snippet) && candidate.url && sameDocument(url, candidate.url);
+  });
+  if (!entry) {
     // robots disallow, upstream block, or an empty page — say why if we can.
-    const reason = snippet.match(/—\s*([a-z_]+)\./i)?.[1] || "";
+    const failureText = entries.map((candidate) => String(candidate?.snippet || "")).find((snippet) => AGENT_NO_CONTENT_RE.test(snippet)) || "";
+    const reason = failureText.match(/—\s*([a-z_]+)\./i)?.[1]
+      || (entries.some((candidate) => candidate?.url) ? "redirected" : "");
     return { text: null, reason };
   }
-  // fetch_url is given our URL, but never assume: a redirect elsewhere is a
-  // different document and must not be presented as this one.
-  if (entry.url && !sameDocument(url, entry.url)) return { text: null, reason: "redirected" };
+  const snippet = String(entry.snippet);
 
   const parts = [
     entry.title ? `# ${cleanText(entry.title)}` : "",
@@ -3887,7 +3947,7 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
     "",
     cleanText(snippet),
   ].filter(Boolean);
-  return { text: parts.join("\n").slice(0, maxChars), reason: "" };
+  return { text: parts.join("\n").slice(0, maxChars), reason: "", url: entry.url };
 }
 
 async function fetchViaPerplexity(url, maxChars, apiKey) {
@@ -4837,6 +4897,8 @@ export {
   isDcinsideUrl,
   isRedditUrl,
   isNamuWikiUrl,
+  namuReadableDocumentUrl,
+  namuRemoteDocumentUrls,
   isMediaWikiUrl,
   isSageUrl,
   isNewsUrl,

@@ -253,6 +253,16 @@ test("core: end-to-end fetch returns body, header, and links block", async () =>
   }
 });
 
+test("core: a document fetch never consults robots.txt", async () => {
+  const stub = installFetch([{ url: URL_ARTICLE, body: ARTICLE_HTML }]);
+  try {
+    await fetchAndFormat(URL_ARTICLE, "", OFFLINE);
+    assert.equal(stub.matching("/robots.txt").length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
 test("core: metadata_only returns metadata without the body", async () => {
   const stub = installFetch([{ url: URL_ARTICLE, body: ARTICLE_HTML }]);
   try {
