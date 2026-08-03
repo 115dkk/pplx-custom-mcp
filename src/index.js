@@ -1441,9 +1441,10 @@ function namuReadableDocumentUrl(url) {
 
 // Historical revisions are unusually fragile: namu.wiki blocks /raw/?rev=
 // outright and may also reject /w/?rev= from a mediated fetcher.  The English
-// NamuWiki frontend exposes the same revision identity, so give fetch_url both
-// exact-revision URLs in one tool call.  sameDocument() below still requires
-// the rev query value to match, preventing a silent fallback to today's page.
+// NamuWiki frontend exposes the same revision identity. Keep both identities
+// here so the remote fetch can use that working frontend while the search
+// fallback retains the Korean document URL. sameDocument() below still
+// requires rev to match, preventing a silent fallback to today's page.
 function namuRemoteDocumentUrls(url) {
   const readableUrl = namuReadableDocumentUrl(url);
   try {
@@ -3428,12 +3429,16 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   if (!apiKey) return null;
   const remoteUrls = namuRemoteDocumentUrls(url);
   const readableUrl = remoteUrls[0];
+  const agentUrl = remoteUrls.at(-1);
   if (readableUrl !== url) {
     warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
   }
 
   try {
-    const agent = await fetchViaAgentUrlTool(readableUrl, maxChars, apiKey, remoteUrls.slice(1));
+    // A two-URL fetch of the blocked Korean revision plus the working English
+    // frontend exceeded our 20 s budget in production. Fetch only the exact
+    // English revision; the query identity check makes this safe.
+    const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey);
     if (agent.text) {
       if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
         warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
@@ -3908,9 +3913,7 @@ const SEARCH_FALLBACK_TIMEOUT_MS = 20_000;
 // The tool reports failure as a sentence inside the snippet, not as an error.
 const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
 
-async function fetchViaAgentUrlTool(url, maxChars, apiKey, alternateUrls = []) {
-  const urls = [...new Set([url, ...alternateUrls])].slice(0, 3);
-  const urlList = urls.map((candidate) => `- ${candidate}`).join("\n");
+async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
   const response = await makeApiRequest(AGENT_ENDPOINT, {
     // Pin the model instead of relying on the undocumented legacy "fast"
     // preset, whose model/tool configuration can change underneath us.
@@ -3918,10 +3921,9 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, alternateUrls = []) {
     max_steps: 1,
     instructions: "You must call fetch_url exactly once with every URL supplied by the user. Do not search or answer from memory.",
     // The body text is read straight off the tool result, so nothing is gained
-    // by having the model repeat it back. Historical NamuWiki calls include
-    // both language frontends and are deliberately issued together.
-    input: `Fetch every URL below in one fetch_url call. Reply with OK.\n${urlList}`,
-    tools: [{ type: "fetch_url", max_urls: urls.length }],
+    // by having the model repeat it back.
+    input: `Fetch this exact URL with fetch_url: ${url}. Reply with OK.`,
+    tools: [{ type: "fetch_url", max_urls: 1 }],
   }, apiKey, AGENT_FETCH_TIMEOUT_MS);
   const data = await response.json();
 

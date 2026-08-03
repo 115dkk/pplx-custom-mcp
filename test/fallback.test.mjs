@@ -200,8 +200,8 @@ test("agent: a historical NamuWiki raw URL accepts only the exact rev from eithe
     const request = JSON.parse(String(stub.matching("/v1/agent")[0].body));
     assert.equal(request.model, "openai/gpt-5.4-mini");
     assert.equal(request.max_steps, 1);
-    assert.equal(request.tools[0].max_urls, 2);
-    assert.ok(request.input.includes(new URL(REVISION_URL).toString()));
+    assert.equal(request.tools[0].max_urls, 1);
+    assert.ok(!request.input.includes(new URL(REVISION_URL).toString()));
     assert.ok(request.input.includes(exactEnglishRevision));
     assert.ok(warnings.some((warning) => /같은 rev의 영어/.test(warning)));
     assert.equal(stub.matching("/search").length, 0);
