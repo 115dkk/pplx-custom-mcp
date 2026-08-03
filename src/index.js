@@ -3438,7 +3438,8 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
     // A two-URL fetch of the blocked Korean revision plus the working English
     // frontend exceeded our 20 s budget in production. Fetch only the exact
     // English revision; the query identity check makes this safe.
-    const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey);
+    const agentTimeout = remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS;
+    const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
     if (agent.text) {
       if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
         warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
@@ -3909,22 +3910,27 @@ const AGENT_MODEL = "openai/gpt-5.4-mini";
 // gets a bounded slice of the budget and hands over on expiry rather than
 // spending the time that the search fallback still needs.
 const AGENT_FETCH_TIMEOUT_MS = 20_000;
+// Exact historical pages can be much larger than current-page shells. Live
+// Worker measurements exceeded 20 s even when fetching only en.namu.wiki, so
+// give this narrow, revision-validated path enough time to finish.
+const AGENT_HISTORICAL_FETCH_TIMEOUT_MS = 45_000;
 const SEARCH_FALLBACK_TIMEOUT_MS = 20_000;
 // The tool reports failure as a sentence inside the snippet, not as an error.
 const AGENT_NO_CONTENT_RE = /^\s*\[fetch_url:\s*no content could be retrieved/i;
 
-async function fetchViaAgentUrlTool(url, maxChars, apiKey) {
+async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FETCH_TIMEOUT_MS) {
   const response = await makeApiRequest(AGENT_ENDPOINT, {
     // Pin the model instead of relying on the undocumented legacy "fast"
     // preset, whose model/tool configuration can change underneath us.
     model: AGENT_MODEL,
     max_steps: 1,
+    max_output_tokens: 32,
     instructions: "You must call fetch_url exactly once with every URL supplied by the user. Do not search or answer from memory.",
     // The body text is read straight off the tool result, so nothing is gained
     // by having the model repeat it back.
     input: `Fetch this exact URL with fetch_url: ${url}. Reply with OK.`,
     tools: [{ type: "fetch_url", max_urls: 1 }],
-  }, apiKey, AGENT_FETCH_TIMEOUT_MS);
+  }, apiKey, timeoutMs);
   const data = await response.json();
 
   const entries = (Array.isArray(data?.output) ? data.output : [])
