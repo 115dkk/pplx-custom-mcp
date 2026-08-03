@@ -3484,78 +3484,10 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   return null;
 }
 
-// Cloudflare Browser Run stays inside the Workers platform but executes the
-// page in managed Chromium, allowing JS/cookie verification that plain Worker
-// fetch cannot complete. It is deliberately limited to NamuWiki after every
-// cheap direct attempt has failed.
-async function tryNamuBrowserRun(url, opts, warnings, attemptTotal) {
-  if (!opts.browserBinding || !isNamuWikiUrl(url)) return null;
-  const readableUrl = namuReadableDocumentUrl(url);
-  try {
-    const response = await opts.browserBinding.quickAction("content", {
-      url: readableUrl,
-      userAgent: NAMU_USER_AGENTS[0],
-      gotoOptions: { waitUntil: "networkidle2", timeout: 30_000 },
-      cacheTTL: 60,
-    });
-    if (!response?.ok) {
-      warnings.push(`Cloudflare Browser Run 실패: HTTP ${response?.status || "unknown"}`);
-      return null;
-    }
-
-    const raw = await response.text();
-    let html = raw;
-    if ((response.headers?.get?.("content-type") || "").includes("application/json")) {
-      try {
-        const parsed = JSON.parse(raw);
-        if (typeof parsed?.result === "string") html = parsed.result;
-      } catch { /* Some successful content responses are raw HTML. */ }
-    }
-    if (!html || looksBlocked(200, html, readableUrl)) {
-      warnings.push("Cloudflare Browser Run도 나무위키 검증 페이지를 통과하지 못함");
-      return null;
-    }
-
-    const sitePage = extractSitePage(readableUrl, html, "namu", opts.cleaning_mode, opts);
-    const text = sitePage?.text
-      || htmlToText(html, opts.cleaning_mode, { include_links: opts.include_links, base_url: readableUrl });
-    if (!sitePage && !hasMeaningfulHtmlContent(html, text)) return null;
-
-    const meta = sitePage?.meta || extractMetadata(html);
-    for (const field of ["title", "author", "published"]) {
-      if (!meta[field] && sitePage?.structured?.[field]) meta[field] = sitePage.structured[field];
-    }
-    const structured = sitePage?.structured
-      || extractSiteStructuredData(readableUrl, html, text, meta, "namu");
-    warnings.push(`Cloudflare Browser Run으로 나무위키 읽기 URL 렌더링: ${readableUrl}`);
-    return {
-      ok: true,
-      text,
-      html,
-      status: 200,
-      attempt: attemptTotal + 1,
-      warnings,
-      source: "browser-run",
-      meta,
-      finalUrl: readableUrl,
-      contentType: response.headers?.get?.("content-type") || "text/html",
-      contentLength: String(html.length),
-      structured,
-      imageUrls: opts.include_images ? selectContentImageUrls(html, readableUrl, opts) : undefined,
-    };
-  } catch (err) {
-    warnings.push(`Cloudflare Browser Run 오류: ${String(err).slice(0, 180)}`);
-    return null;
-  }
-}
-
 // Every direct attempt is spent. Walk the remaining ladder — document handling,
 // the paid Perplexity site: fallback, page metadata — and return whatever still
 // carries information, rather than nothing at all. Caller applies finish().
 async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags }) {
-  const browserPage = await tryNamuBrowserRun(url, opts, warnings, attemptTotal);
-  if (browserPage) return browserPage;
-
   if (flags.document) {
     const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
     if (remote) {
@@ -3644,7 +3576,6 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
     use_cache: opts.use_cache !== false,
     cache_ttl_seconds: opts.cache_ttl_seconds ?? CACHE_TTL_SECONDS_DEFAULT,
     debug: !!opts.debug,
-    browserBinding: opts.browserBinding,
   };
   const cached = await readFetchCache(url, normalizedOpts);
   if (cached) return cached;
@@ -4832,7 +4763,7 @@ function toolError(message) {
   return { content, isError: true };
 }
 
-function createServer(apiKey, runtime = {}) {
+function createServer(apiKey) {
   const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
 
   server.registerTool(
@@ -4862,7 +4793,7 @@ function createServer(apiKey, runtime = {}) {
       outputSchema: FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      const opts = normalizeFetchOpts(args, { browserBinding: runtime.browserBinding });
+      const opts = normalizeFetchOpts(args);
       const { result, text, imageContent } = await fetchAndFormat(args.url, apiKey, opts);
       const structuredContent = buildFetchStructured(args.url, result, text, opts);
       // Text first, then any image blocks collected for multimodal clients.
@@ -4886,7 +4817,7 @@ function createServer(apiKey, runtime = {}) {
       for (let i = 0; i < args.urls.length; i++) {
         const url = args.urls[i];
         try {
-          const opts = normalizeFetchOpts(args, { max_chars: args.max_chars ?? 4000, browserBinding: runtime.browserBinding });
+          const opts = normalizeFetchOpts(args, { max_chars: args.max_chars ?? 4000 });
           const { result, text } = await fetchAndFormat(url, apiKey, opts);
           parts.push(`## [${i + 1}] ${url}\n\n${text}`);
           items.push(buildFetchStructured(url, result, text, opts).result);
@@ -4945,7 +4876,7 @@ function createServer(apiKey, runtime = {}) {
             include_links: args.include_links,
             debug: args.debug,
             use_cache: args.use_cache,
-          }, { browserBinding: runtime.browserBinding });
+          });
           const fetched = await fetchAndFormat(result.url, apiKey, fetchOpts);
           chunks.push(`\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`);
           fetchedItems.push(buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result);

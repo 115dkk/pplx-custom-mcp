@@ -65,7 +65,7 @@ export default {
       );
     }
 
-    const server = createServer(apiKey, { browserBinding: env.BROWSER });
+    const server = createServer(apiKey);
     const handler = createMcpHandler(server);
     const response = await handler(request, env, ctx);
 
