@@ -18,6 +18,8 @@ import {
 import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
 const NAMU_URL = "https://namu.wiki/w/서버리스";
+const NAMU_RAW_REVISION_URL = "https://namu.wiki/raw/서버리스?rev=42";
+const NAMU_READABLE_REVISION_URL = new URL("https://namu.wiki/w/서버리스?rev=42").toString();
 const KWIKI_URL = "https://k-wiki.kr/wiki/엣지_컴퓨팅";
 const WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/Anycast";
 const NAMU_HTML = fixture("namu-article.html");
@@ -75,6 +77,23 @@ test("namu: cleaner drops TOC-shaped lines but keeps real headings", () => {
   assert.doesNotMatch(cleaned, /5 \. 둘러보기/, "TOC line survived");
   assert.match(cleaned, /^1\. 개요$/m, "real heading was removed");
   assert.match(cleaned, /본문 문단입니다/);
+});
+
+test("namu: raw revisions use the readable route and Perplexity-User UA directly", async () => {
+  const stub = installFetch([{ url: NAMU_READABLE_REVISION_URL, body: NAMU_HTML }]);
+  try {
+    const { result, text } = await fetchAndFormat(NAMU_RAW_REVISION_URL, "", OFFLINE);
+    assert.equal(result.status, 200);
+    assert.equal(result.source, "direct");
+    assert.equal(result.finalUrl, NAMU_READABLE_REVISION_URL);
+    assert.equal(stub.calls.length, 1, "the first direct attempt should succeed");
+    assert.equal(stub.calls[0].url, NAMU_READABLE_REVISION_URL);
+    assert.match(stub.calls[0].headers.get("User-Agent"), /Perplexity-User\/1\.0/);
+    assert.ok(result.warnings.some((warning) => /읽기 URL을 직접 확인/.test(warning)));
+    assert.match(text, /코드 실행 단위로만 과금되는 실행 모델/);
+  } finally {
+    stub.restore();
+  }
 });
 
 test("mediawiki: mw-content-text body is extracted and chrome removed", () => {

@@ -37,6 +37,14 @@ const USER_AGENTS = [
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 ];
 
+// Perplexity documents this as its user-requested fetch identity. Unlike the
+// indexing bot, it generally ignores robots.txt. NamuWiki currently serves
+// /w/?rev= to this UA while refusing /raw/?rev= even from a local browser.
+const NAMU_USER_AGENTS = [
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)",
+  ...USER_AGENTS,
+];
+
 const DCINSIDE_USER_AGENTS = [
   "dcinside.app",
   "dcinside.app",
@@ -1522,10 +1530,20 @@ function buildSageFullTextUrl(url) {
 
 function userAgentsForSitePreset(preset) {
   if (preset === "reddit") return REDDIT_USER_AGENTS;
+  if (preset === "namu") return NAMU_USER_AGENTS;
   return preset === "dcinside" ? DCINSIDE_USER_AGENTS : USER_AGENTS;
 }
 
 function fetchUrlForAttempt(url, preset, attemptIndex) {
+  if (preset === "namu") {
+    const readableUrl = namuReadableDocumentUrl(url);
+    try {
+      if (/^\/raw\//i.test(new URL(url).pathname) && /^\/w\//i.test(new URL(readableUrl).pathname)) {
+        return { url: readableUrl, kind: "namu-readable" };
+      }
+    } catch { /* URL was validated by the caller. */ }
+    return { url, kind: "original" };
+  }
   if (preset === "reddit") {
     const jsonUrl = buildRedditJsonUrl(url);
     if (jsonUrl && (attemptIndex > 0 || /\.json\/?$/i.test(new URL(url).pathname))) {
@@ -3586,6 +3604,10 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   };
   applySitePresetCookies(cookieJar, normalizedOpts.site_preset);
   const userAgents = userAgentsForSitePreset(normalizedOpts.site_preset);
+  const firstAttemptTarget = fetchUrlForAttempt(url, normalizedOpts.site_preset, 0);
+  if (firstAttemptTarget.kind === "namu-readable") {
+    warnings.push(`나무위키 /raw/ 경로 대신 동일 문서의 읽기 URL을 직접 확인: ${firstAttemptTarget.url}`);
+  }
 
   const finish = async (result) => {
     const enriched = {
