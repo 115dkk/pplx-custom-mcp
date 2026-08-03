@@ -3972,9 +3972,12 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
     // robots disallow, upstream block, or an empty page — say why if we can.
     const failureText = entries.map((candidate) => String(candidate?.snippet || "")).find((snippet) => AGENT_NO_CONTENT_RE.test(snippet)) || "";
     const outputTypes = [...new Set(output.map((item) => item?.type).filter(Boolean))].join(",");
+    const emptyFetchResult = output.some((item) => item?.type === "fetch_url_results");
     const reason = failureText.match(/—\s*([a-z_]+)\./i)?.[1]
       || data?.error?.code
-      || (entries.some((candidate) => candidate?.url) ? "redirected" : `tool_not_called${outputTypes ? ` (${outputTypes})` : ""}`);
+      || (entries.some((candidate) => candidate?.url)
+        ? "redirected"
+        : `${emptyFetchResult ? "no_fetch_content" : "tool_not_called"}${outputTypes ? ` (${outputTypes})` : ""}`);
     return { text: null, reason };
   }
   const snippet = String(entry.snippet);

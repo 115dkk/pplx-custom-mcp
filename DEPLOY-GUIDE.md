@@ -93,5 +93,7 @@ Codex 앱·CLI·IDE 확장은 같은 MCP 설정을 공유합니다. 등록 후 �
   - `perplexity_fetch_many` — 여러 URL을 하나의 evidence pack으로 fetch
   - `perplexity_search_fetch` — 검색 + dedupe + 상위 K개 fetch 원샷 워크플로
   - 모든 도구는 `outputSchema`와 `structuredContent`를 제공
+
+> 나무위키가 UA와 출구 IP를 함께 차단하면 Workers와 Perplexity 폴백만으로 과거판 본문을 보장할 수 없습니다. 이때는 Worker를 MCP 진입점으로 유지하되 별도 신뢰 가능한 fetch relay가 필요합니다.
 - **CORS**: 모든 origin 허용 (Claude.ai 브라우저 클라이언트 지원)
 - **비용**: Workers 무료. 직접 fetch는 무료. 막힌 페이지의 `fetch_url`은 도구 호출 $0.0005 + 모델 토큰 비용이며, 후속 검색 폴백은 호출당 $0.005.

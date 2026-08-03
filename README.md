@@ -57,6 +57,8 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 
 Worker의 직접 fetch는 `robots.txt`를 요청하거나 적용하지 않습니다. 크롤러가 아니라 사용자가 지목한 URL 하나를 확인하는 fetch 유틸이기 때문입니다. 나무위키 `/raw/`는 사이트가 과거판 경로를 별도로 차단하므로 동일 문서·동일 `rev`의 `/w/` 읽기 URL로 바꾼 뒤, 사용자 요청용 공식 `Perplexity-User` UA를 먼저 써서 Worker가 직접 가져옵니다. 직접 경로도 막힌 경우에만 Perplexity `fetch_url`과 동일 문서 검증 검색 폴백이 이어지며, 현재판이나 다른 `rev`가 돌아오면 폐기합니다.
 
+나무위키 WAF가 UA와 출구 IP를 함께 검증하는 시점에는 Workers, Cloudflare Browser Run, Perplexity `fetch_url`이 모두 거절될 수 있습니다. 이 경우 코드는 현재판을 과거판인 것처럼 반환하지 않고 실패를 명시합니다. 완전한 우회에는 Worker를 진입점으로 유지하면서 Cloudflare 외부의 별도 fetch relay를 연결해야 하며, 공개 프록시는 보안·가용성 문제로 기본 제공하지 않습니다.
+
 ### `perplexity_fetch_many`
 알려진 URL을 최대 5개까지 한 번에 가져와 URL별 섹션으로 나눠 돌려줍니다.
 
