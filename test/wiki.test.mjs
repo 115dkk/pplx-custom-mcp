@@ -96,6 +96,30 @@ test("namu: raw revisions use the readable route and Perplexity-User UA directly
   }
 });
 
+test("namu: Browser Run is the Workers-native fallback after direct 403s", async () => {
+  const direct = installFetch([{ url: NAMU_READABLE_REVISION_URL, status: 403, body: "<title>Just a moment...</title>Access denied" }]);
+  const calls = [];
+  const browserBinding = {
+    async quickAction(action, options) {
+      calls.push({ action, options });
+      return new Response(NAMU_HTML, { status: 200, headers: { "content-type": "text/html" } });
+    },
+  };
+  try {
+    const { result, text } = await fetchAndFormat(NAMU_RAW_REVISION_URL, "", { ...OFFLINE, browserBinding });
+    assert.equal(result.source, "browser-run");
+    assert.equal(result.status, 200);
+    assert.equal(result.finalUrl, NAMU_READABLE_REVISION_URL);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].action, "content");
+    assert.equal(calls[0].options.url, NAMU_READABLE_REVISION_URL);
+    assert.match(calls[0].options.userAgent, /Perplexity-User\/1\.0/);
+    assert.match(text, /코드 실행 단위로만 과금되는 실행 모델/);
+  } finally {
+    direct.restore();
+  }
+});
+
 test("mediawiki: mw-content-text body is extracted and chrome removed", () => {
   const article = extractMediaWikiArticleData(KWIKI_URL, KWIKI_HTML, "balanced", {});
   assert.ok(article, "extractor returned null — the article body would be missing");

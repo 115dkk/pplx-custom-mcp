@@ -89,7 +89,7 @@ Codex 앱·CLI·IDE 확장은 같은 MCP 설정을 공유합니다. 등록 후 �
 - **MCP SDK ≥1.26.0 호환**: 요청마다 새 McpServer 인스턴스 생성
 - **4개 도구** (v1.2.2):
   - `perplexity_search` — Perplexity `/search` 호출, source_profile/dedupe/date signals 지원, ~$0.005/회
-  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션. 직접 경로가 막히면 Perplexity `fetch_url`, 이어서 동일 문서 검증 검색 폴백 사용. 나무위키 `/raw/`는 동일 `rev`의 `/w/` 읽기 URL과 공식 `Perplexity-User` UA로 Worker가 먼저 직접 확인. 디시 글은 본문 이미지를 자동 첨부하고, 다른 사이트는 `include_images=true`로 이미지 블록과 출처 URL을 함께 반환
+  - `perplexity_fetch` — Worker 직접 fetch + JS 우회 + 단순 확인 form 자동 제출 + Steam 성인 연령 확인 처리 + 잡음 정제 + page 기반 본문 페이지네이션. 나무위키 `/raw/`는 동일 `rev`의 `/w/` 읽기 URL과 공식 `Perplexity-User` UA로 먼저 확인하고, 403이면 Workers Browser Run으로 렌더링. 이후 Perplexity `fetch_url`, 동일 문서 검증 검색 폴백 사용. 디시 글은 본문 이미지를 자동 첨부하고, 다른 사이트는 `include_images=true`로 이미지 블록과 출처 URL을 함께 반환
   - `perplexity_fetch_many` — 여러 URL을 하나의 evidence pack으로 fetch
   - `perplexity_search_fetch` — 검색 + dedupe + 상위 K개 fetch 원샷 워크플로
   - 모든 도구는 `outputSchema`와 `structuredContent`를 제공

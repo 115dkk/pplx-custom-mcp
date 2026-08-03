@@ -1,10 +1,13 @@
 {
   "name": "perplexity-mcp",
   "main": "src/worker.js",
-  "compatibility_date": "2025-09-23",
+  "compatibility_date": "2026-08-03",
   "compatibility_flags": [
     "nodejs_compat"
   ],
+  "browser": {
+    "binding": "BROWSER"
+  },
   "ratelimits": [
     {
       "name": "MCP_RATE_LIMITER",
