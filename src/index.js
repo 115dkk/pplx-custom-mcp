@@ -3925,6 +3925,9 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
     model: AGENT_MODEL,
     max_steps: 1,
     max_output_tokens: 32,
+    // The Agent API otherwise leaves tool use on "auto" and occasionally
+    // returns a message without invoking our only configured tool.
+    tool_choice: "required",
     instructions: "You must call fetch_url exactly once with every URL supplied by the user. Do not search or answer from memory.",
     // The body text is read straight off the tool result, so nothing is gained
     // by having the model repeat it back.
