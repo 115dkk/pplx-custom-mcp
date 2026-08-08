@@ -365,7 +365,7 @@ test("wayback: no usable capture falls through to the Perplexity ladder", async 
     const { result, text } = await fetchAndFormat(ARTICLE_URL, "pplx-test", OFFLINE);
     assert.equal(result.source, "perplexity");
     assert.match(text, /한국어 위키위키 사이트이다/);
-    assert.equal(stub.matching("archive.org").length, 1, "the archive should have been consulted before paying");
+    assert.equal(stub.calls.filter((call) => call.url.startsWith(WAYBACK_AVAILABILITY)).length, 1, "the archive should have been consulted before paying");
   } finally {
     stub.restore();
   }
@@ -412,8 +412,8 @@ test("wayback: for non-Namu sites the archive is the backstop after paid retriev
     const { result, text } = await fetchAndFormat(PAGE_URL, "pplx-test", OFFLINE);
     assert.equal(result.source, "wayback");
     assert.match(text, /headless browser/);
-    const firstArchiveCall = stub.calls.findIndex((call) => call.url.includes("archive.org"));
-    const firstPaidCall = stub.calls.findIndex((call) => call.url.includes("api.perplexity.ai"));
+    const firstArchiveCall = stub.calls.findIndex((call) => call.url.startsWith(WAYBACK_AVAILABILITY));
+    const firstPaidCall = stub.calls.findIndex((call) => call.url.startsWith("https://api.perplexity.ai/"));
     assert.ok(firstPaidCall !== -1, "paid retrieval should have been attempted");
     assert.ok(firstArchiveCall > firstPaidCall, "paid retrieval keeps priority for non-Namu sites");
   } finally {
