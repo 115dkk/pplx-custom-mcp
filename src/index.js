@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.2.2";
+const VERSION = "1.3.0";
 
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
@@ -3352,6 +3352,11 @@ const DEGRADATION_TEXT = {
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
   },
+  wayback: {
+    steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
+    blocked: "[봇 차단으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
+    shell: "[직접 fetch가 SPA 셸만 반환 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
+  },
   metadata: {
     steamAgeGate: "[경고: Steam 성인 연령 확인 + Perplexity 폴백 실패, 메타데이터만 추출]",
     blocked: "[경고: 봇 차단 + Perplexity 폴백 실패, 메타데이터만 추출]",
@@ -3484,6 +3489,104 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
   return null;
 }
 
+// ── Wayback Machine snapshot fallback ───────────────────────────────
+// namu.wiki's WAF refuses Cloudflare Workers egress and Perplexity's fetch_url
+// alike, but the Internet Archive keeps recent captures of the server-rendered
+// pages and web.archive.org itself stays reachable from a Worker. A capture is
+// stale by definition, so this path never replaces a successful direct or
+// remote fetch — it only stands in where the alternative is a search snippet
+// or nothing. The `id_` timestamp flag returns the original markup without the
+// Wayback toolbar or rewritten links, so the site extractor sees exactly what
+// the origin served and relative links resolve against the original host.
+const WAYBACK_AVAILABILITY_TIMEOUT_MS = 8_000;
+const WAYBACK_SNAPSHOT_TIMEOUT_MS = 12_000;
+
+// The original URL embedded after /web/<timestamp>/ in a snapshot URL, or "".
+function waybackOriginalUrl(snapshotUrl) {
+  const match = String(snapshotUrl || "").match(/^https?:\/\/web\.archive\.org\/web\/[^/]+\/(.+)$/i);
+  return match ? match[1] : "";
+}
+
+async function tryWaybackSnapshot(url, opts, warnings, attemptTotal) {
+  // /raw/ documents are archived under their readable /w/ identity, if at all.
+  const lookupUrl = namuReadableDocumentUrl(url);
+  let closest;
+  const availabilityController = new AbortController();
+  const availabilityTimer = setTimeout(() => availabilityController.abort(), WAYBACK_AVAILABILITY_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(lookupUrl)}`, {
+      headers: { "User-Agent": USER_AGENTS[1], Accept: "application/json" },
+      signal: availabilityController.signal,
+    });
+    if (!res.ok) return null;
+    closest = (await res.json())?.archived_snapshots?.closest;
+  } catch (err) {
+    warnings.push(`Wayback 조회 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    return null;
+  } finally {
+    clearTimeout(availabilityTimer);
+  }
+  if (!closest?.available || String(closest.status) !== "200" || !closest.url) return null;
+  // The archive answers near-miss URLs too; only the requested document will
+  // do, for the same reason as the search fallback below.
+  if (!sameDocument(lookupUrl, waybackOriginalUrl(closest.url))) return null;
+
+  const snapshotUrl = String(closest.url)
+    .replace(/^http:\/\//i, "https://")
+    .replace(/(\/web\/\d{4,14})\//, "$1id_/");
+  if (!isSafeFetchUrl(snapshotUrl)) return null;
+
+  let page;
+  const snapshotController = new AbortController();
+  const snapshotTimer = setTimeout(() => snapshotController.abort(), WAYBACK_SNAPSHOT_TIMEOUT_MS);
+  try {
+    page = await fetchOnce(snapshotUrl, USER_AGENTS[1], snapshotController.signal, new Map(), "auto");
+  } catch (err) {
+    warnings.push(`Wayback 스냅샷 fetch 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    return null;
+  } finally {
+    clearTimeout(snapshotTimer);
+  }
+  if (!(page.status >= 200 && page.status < 300) || !page.body) return null;
+  // The archive faithfully replays whatever it crawled — including an archived
+  // challenge page. That capture proves nothing except that the WAF was on.
+  if (looksBlocked(200, page.body, lookupUrl)) return null;
+
+  // Extract with the ORIGINAL url so the site preset (namu, news, …) applies
+  // and relative links resolve against the origin, not web.archive.org.
+  const sitePage = extractSitePage(lookupUrl, page.body, opts.site_preset, opts.cleaning_mode, opts);
+  const text = sitePage?.text
+    || htmlToText(page.body, opts.cleaning_mode, { include_links: opts.include_links, base_url: lookupUrl });
+  if (!sitePage && !hasMeaningfulHtmlContent(page.body, text)) return null;
+
+  const timestamp = String(closest.timestamp || "");
+  const capturedAt = timestamp.length >= 8
+    ? `${timestamp.slice(0, 4)}-${timestamp.slice(4, 6)}-${timestamp.slice(6, 8)}`
+    : "unknown";
+  warnings.push(`직접 fetch가 차단되어 Wayback Machine 스냅샷(${capturedAt} 캡처)으로 대체: ${snapshotUrl} — 캡처 이후의 편집은 반영되지 않습니다.`);
+
+  const meta = sitePage?.meta || extractMetadata(page.body);
+  for (const field of ["title", "author", "published"]) {
+    if (!meta[field] && sitePage?.structured?.[field]) meta[field] = sitePage.structured[field];
+  }
+  return {
+    ok: true,
+    text,
+    html: page.body,
+    status: page.status,
+    attempt: attemptTotal + 1,
+    warnings,
+    partial: true,
+    source: "wayback",
+    capturedAt,
+    meta,
+    finalUrl: page.finalUrl || snapshotUrl,
+    contentType: page.contentType,
+    contentLength: page.contentLength,
+    structured: { ...(sitePage?.structured || {}), archived_snapshot: snapshotUrl, archived_at: capturedAt },
+  };
+}
+
 // Every direct attempt is spent. Walk the remaining ladder — document handling,
 // the paid Perplexity site: fallback, page metadata — and return whatever still
 // carries information, rather than nothing at all. Caller applies finish().
@@ -3522,6 +3625,26 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
     : "";
   const cause = degradationCause(flags);
 
+  // The archive stores full server-rendered bodies for free, but they are
+  // stale. namu.wiki refuses Perplexity's fetcher as firmly as it refuses us,
+  // so for NamuWiki the archive is tried before any paid call; everywhere else
+  // paid retrieval keeps priority because it returns the CURRENT page. Steam
+  // age-gated pages are skipped: their captures are the gate itself.
+  const tryWayback = async () => {
+    if (flags.steamAgeGate) return null;
+    const archived = await tryWaybackSnapshot(url, opts, warnings, attemptTotal);
+    if (!archived) return null;
+    return {
+      ...archived,
+      text: `${DEGRADATION_TEXT.wayback[cause].replace("{date}", archived.capturedAt)}\n\n${archived.text}`.slice(0, FETCH_MAX_CHARS_LIMIT),
+    };
+  };
+  const waybackFirst = isNamuWikiUrl(url);
+  if (waybackFirst) {
+    const archived = await tryWayback();
+    if (archived) return archived;
+  }
+
   // Paid, but works on Cloudflare-protected SPAs that pre-render for no UA.
   const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
   if (remote) {
@@ -3535,6 +3658,11 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
       meta,
       ...lastResponseFields(last),
     };
+  }
+
+  if (!waybackFirst) {
+    const archived = await tryWayback();
+    if (archived) return archived;
   }
 
   if (metaText) {
@@ -4527,7 +4655,7 @@ const SEARCH_DESCRIPTION = [
 
 const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
-  "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, and short Worker Cache reuse.",
+  "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
   "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
   "If the body exceeds max_chars, call again with the same URL and page+1.",
@@ -5012,6 +5140,8 @@ export {
   fetchViaPerplexity,
   fetchViaAgentUrlTool,
   fetchRemoteBody,
+  tryWaybackSnapshot,
+  waybackOriginalUrl,
   sameDocument,
   isOpaqueSlug,
   runSearch,

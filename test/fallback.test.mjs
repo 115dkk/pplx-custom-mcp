@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { sameDocument, isOpaqueSlug, fetchViaPerplexity, fetchRemoteBody, fetchAndFormat, namuReadableDocumentUrl, namuRemoteDocumentUrls } from "../src/index.js";
-import { installFetch, OFFLINE } from "./helpers/harness.mjs";
+import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
 const API = "https://api.perplexity.ai/search";
 const THREAD_URL = "https://namu.wiki/thread/FunnySulkySpuriousGate";
@@ -305,5 +305,118 @@ test("agent: our own search fallback still runs after a fetch_url timeout", asyn
     } finally {
       stub.restore();
     }
+  }
+});
+
+// ── Wayback Machine snapshot fallback ───────────────────────────────
+// namu.wiki's WAF blocks Workers egress and Perplexity's fetcher alike, but
+// web.archive.org keeps full server-rendered captures and stays reachable.
+// The archive must serve the FULL page for free before any paid call for
+// NamuWiki, and act as the backstop after paid retrieval elsewhere.
+
+const WAYBACK_AVAILABILITY = "https://archive.org/wayback/available";
+const CHALLENGE_HTML = "<html><head><title>Just a moment...</title></head><body>Access denied</body></html>";
+const NAMU_ARTICLE_HTML = fixture("namu-article.html");
+const NAMU_SNAPSHOT_TS = "20260611142531";
+const NAMU_PAGE_URL = "https://namu.wiki/w/서버리스";
+
+function waybackClosest(originalUrl, timestamp = NAMU_SNAPSHOT_TS) {
+  return { available: true, status: "200", timestamp, url: `http://web.archive.org/web/${timestamp}/${originalUrl}` };
+}
+
+function waybackStub({ closest, snapshotBody = "", extraRoutes = [] }) {
+  return installFetch([
+    { url: WAYBACK_AVAILABILITY, body: JSON.stringify({ archived_snapshots: closest ? { closest } : {} }), headers: { "content-type": "application/json" } },
+    { url: (u) => u.includes("id_/"), body: snapshotBody },
+    ...extraRoutes,
+    { url: (u) => u.startsWith("https://namu.wiki/") || u.startsWith("https://en.namu.wiki/"), status: 403, body: CHALLENGE_HTML },
+  ]);
+}
+
+test("wayback: a blocked NamuWiki page is served in full from the archive without a paid call", async () => {
+  const stub = waybackStub({
+    closest: waybackClosest(NAMU_PAGE_URL),
+    snapshotBody: NAMU_ARTICLE_HTML,
+  });
+  try {
+    const { result, text } = await fetchAndFormat(NAMU_PAGE_URL, "pplx-test", OFFLINE);
+    assert.equal(result.ok, true);
+    assert.equal(result.source, "wayback");
+    assert.match(text, /Wayback Machine 스냅샷/);
+    assert.match(text, /2026-06-11/, "the capture date must be visible to the caller");
+    assert.match(text, /코드 실행 단위로만 과금되는 실행 모델/, "the full article body should be present, not a snippet");
+    assert.doesNotMatch(text, /IP 우회 수단/, "the namu extractor must run on the archived markup");
+    assert.equal(result.structured.archived_at, "2026-06-11");
+    assert.equal(stub.matching("api.perplexity.ai").length, 0, "the free archive hit must pre-empt every paid call");
+    assert.ok(result.warnings.some((warning) => /Wayback Machine 스냅샷/.test(warning)));
+  } finally {
+    stub.restore();
+  }
+});
+
+test("wayback: no usable capture falls through to the Perplexity ladder", async () => {
+  const stub = installFetch([
+    { url: WAYBACK_AVAILABILITY, body: JSON.stringify({ archived_snapshots: {} }), headers: { "content-type": "application/json" } },
+    { url: AGENT_API, method: "POST", body: JSON.stringify({ output: [] }), headers: { "content-type": "application/json" } },
+    { url: API, method: "POST", body: JSON.stringify({ results: [{ title: "나무위키", url: ARTICLE_URL, snippet: "한국어 위키위키 사이트이다." }] }), headers: { "content-type": "application/json" } },
+    { url: (u) => u.startsWith("https://namu.wiki/"), status: 403, body: CHALLENGE_HTML },
+  ]);
+  try {
+    const { result, text } = await fetchAndFormat(ARTICLE_URL, "pplx-test", OFFLINE);
+    assert.equal(result.source, "perplexity");
+    assert.match(text, /한국어 위키위키 사이트이다/);
+    assert.equal(stub.calls.filter((call) => call.url.startsWith(WAYBACK_AVAILABILITY)).length, 1, "the archive should have been consulted before paying");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("wayback: an archived challenge page is discarded, not presented as content", async () => {
+  const stub = waybackStub({
+    closest: waybackClosest(NAMU_PAGE_URL),
+    snapshotBody: CHALLENGE_HTML,
+  });
+  try {
+    const { result } = await fetchAndFormat(NAMU_PAGE_URL, "", OFFLINE);
+    assert.notEqual(result.source, "wayback", "an archived WAF page proves nothing and must be rejected");
+    assert.equal(result.source, "metadata");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("wayback: a capture of a different document is rejected before it is fetched", async () => {
+  const stub = waybackStub({
+    closest: waybackClosest("https://namu.wiki/w/나무위키"),
+    snapshotBody: NAMU_ARTICLE_HTML,
+  });
+  try {
+    const { result } = await fetchAndFormat(NAMU_PAGE_URL, "", OFFLINE);
+    assert.notEqual(result.source, "wayback");
+    assert.equal(stub.matching("id_/").length, 0, "the near-miss snapshot must not even be fetched");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("wayback: for non-Namu sites the archive is the backstop after paid retrieval fails", async () => {
+  const PAGE_URL = "https://example.com/blog/no-headless";
+  const stub = installFetch([
+    { url: WAYBACK_AVAILABILITY, body: JSON.stringify({ archived_snapshots: { closest: waybackClosest(PAGE_URL, "20260618100000") } }), headers: { "content-type": "application/json" } },
+    { url: (u) => u.includes("id_/"), body: fixture("generic-article.html") },
+    { url: AGENT_API, method: "POST", body: JSON.stringify({ output: [] }), headers: { "content-type": "application/json" } },
+    { url: API, method: "POST", body: JSON.stringify({ results: [] }), headers: { "content-type": "application/json" } },
+    { url: "https://example.com/", status: 403, body: CHALLENGE_HTML },
+  ]);
+  try {
+    const { result, text } = await fetchAndFormat(PAGE_URL, "pplx-test", OFFLINE);
+    assert.equal(result.source, "wayback");
+    assert.match(text, /headless browser/);
+    const firstArchiveCall = stub.calls.findIndex((call) => call.url.startsWith(WAYBACK_AVAILABILITY));
+    const firstPaidCall = stub.calls.findIndex((call) => call.url.startsWith("https://api.perplexity.ai/"));
+    assert.ok(firstPaidCall !== -1, "paid retrieval should have been attempted");
+    assert.ok(firstArchiveCall > firstPaidCall, "paid retrieval keeps priority for non-Namu sites");
+  } finally {
+    stub.restore();
   }
 });
