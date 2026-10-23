@@ -8,6 +8,8 @@ const VERSION = "1.3.0";
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
 const FETCH_TOTAL_BUDGET_MS = 25_000;
+const FETCH_DEADLINE_MS = 40_000;
+const TOOL_DEADLINE_MS = 50_000;
 const FETCH_MAX_CHARS_DEFAULT = 8_000;
 const FETCH_MAX_CHARS_LIMIT = 32_000;
 const FETCH_URL_MAX_LENGTH = 4_096;
@@ -1283,7 +1285,7 @@ async function fetchOnce(url, ua, signal, cookieJar, sitePreset = "auto") {
 }
 
 function looksBlocked(status, body, pageUrl = "") {
-  if (status === 403 || status === 503 || status === 429) return true;
+  if ([403, 419, 429, 430, 503].includes(status)) return true;
   if (isDcinsideAuthOrSinkUrl(pageUrl)) return true;
   // Common challenge/verification page markers (HTTP 200 with bot-block content).
   //
@@ -3333,11 +3335,25 @@ function lastResponseFields(last) {
   };
 }
 
-// Why the direct fetch did not produce a body. Same three-way choice was
-// spelled out at each of the three degradation points.
+// Absolute end time for one fetch; every stage asks how much is left.
+function createDeadline(ms) {
+  const end = Date.now() + ms;
+  return { end, remaining: () => Math.max(0, end - Date.now()) };
+}
+
+function recordDeadlineStage(deadline, stage, startedAt, ok, note) {
+  if (!Array.isArray(deadline?.stages)) return;
+  const entry = { stage, ms: Date.now() - startedAt, ok };
+  if (note) entry.note = note;
+  deadline.stages.push(entry);
+}
+
+// Why the direct fetch did not produce a body. Same choice is reused at each
+// degradation point so the explanation reflects the strongest observed cause.
 function degradationCause(flags) {
   if (flags.steamAgeGate) return "steamAgeGate";
   if (flags.blocked) return "blocked";
+  if (flags.timedOut) return "timeout";
   return "shell";
 }
 
@@ -3345,21 +3361,25 @@ const DEGRADATION_TEXT = {
   agentFetch: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
+    timeout: "[직접 fetch 시간 초과 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
   },
   perplexity: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
+    timeout: "[직접 fetch 시간 초과 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
   },
   wayback: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
+    timeout: "[직접 fetch 시간 초과 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
   },
   metadata: {
     steamAgeGate: "[경고: Steam 성인 연령 확인 + Perplexity 폴백 실패, 메타데이터만 추출]",
     blocked: "[경고: 봇 차단 + Perplexity 폴백 실패, 메타데이터만 추출]",
+    timeout: "[경고: 직접 fetch 시간 초과 + Perplexity 폴백 실패, 메타데이터만 추출]",
     shell: "[경고: JS 렌더링 + Perplexity 폴백 실패, 메타데이터만 추출]",
   },
 };
@@ -3370,6 +3390,8 @@ function failureText(flags, status) {
       return `[경고: Steam 성인 연령 확인 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
     case "blocked":
       return `[경고: 봇 차단 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
+    case "timeout":
+      return `[경고: 직접 fetch 시간 초과(HTTP ${status}) + 폴백 실패, 본문 추출 실패]`;
     default:
       return `[경고: 응답 본문 부족(HTTP ${status}) + Perplexity 폴백 실패]`;
   }
@@ -3449,7 +3471,7 @@ async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
 // refuse, error, or time out — the search fallback still gets its turn, because
 // a robots-disallowed page is usually still indexed and searchable.
 // Returns { text, source } or null.
-async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
+async function fetchRemoteBody(url, maxChars, apiKey, warnings, deadline) {
   if (!apiKey) return null;
   const remoteUrls = namuRemoteDocumentUrls(url);
   const readableUrl = remoteUrls[0];
@@ -3462,29 +3484,45 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
     warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
   }
 
-  try {
-    // A two-URL fetch of the blocked Korean revision plus the working English
-    // frontend exceeded our 20 s budget in production. Fetch only the exact
-    // English revision; the query identity check makes this safe.
-    const agentTimeout = remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS;
-    const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
-    if (agent.text) {
-      if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
-        warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
+  // A two-URL fetch of the blocked Korean revision plus the working English
+  // frontend exceeded our 20 s budget in production. Fetch only the exact
+  // English revision; the query identity check makes this safe.
+  const agentLimit = remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS;
+  const agentTimeout = deadline ? Math.min(agentLimit, deadline.remaining() - 5_000) : agentLimit;
+  if (deadline && agentTimeout < 6_000) {
+    warnings.push("시간 예산 부족으로 Perplexity fetch_url 생략");
+    recordDeadlineStage(deadline, "agent-fetch-url", Date.now(), false, "skipped: budget");
+  } else {
+    const stageStart = Date.now();
+    try {
+      const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
+      if (agent.text) {
+        if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
+          warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
+        }
+        recordDeadlineStage(deadline, "agent-fetch-url", stageStart, true);
+        return { text: agent.text, source: "agent-fetch-url" };
       }
-      return { text: agent.text, source: "agent-fetch-url" };
+      if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, agent.reason || "no content");
+    } catch (err) {
+      warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, err?.name === "AbortError" ? "timeout" : String(err).slice(0, 80));
     }
-    if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
-  } catch (err) {
-    warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
   }
 
   // Always reached, whatever happened above.
-  try {
-    const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey);
+  const searchStart = Date.now();
+  if (deadline && Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000) < 4_000) {
+    warnings.push("시간 예산 부족으로 Perplexity 검색 폴백 생략");
+    recordDeadlineStage(deadline, "perplexity-search", searchStart, false, "skipped: budget");
+  } else try {
+    const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey, deadline);
+    recordDeadlineStage(deadline, "perplexity-search", searchStart, !!searched, searched ? undefined : "no matching result");
     if (searched) return { text: searched, source: "perplexity" };
   } catch (err) {
     warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
+    recordDeadlineStage(deadline, "perplexity-search", searchStart, false, String(err).slice(0, 80));
   }
   return null;
 }
@@ -3507,63 +3545,108 @@ function waybackOriginalUrl(snapshotUrl) {
   return match ? match[1] : "";
 }
 
-async function tryWaybackSnapshot(url, opts, warnings, attemptTotal) {
+async function tryWaybackSnapshot(url, opts, warnings, attemptTotal, deadline) {
+  const stageStart = Date.now();
+  if (deadline && deadline.remaining() < 4_000) {
+    warnings.push("시간 예산 부족으로 Wayback 조회 생략");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "skipped: budget");
+    return null;
+  }
   // /raw/ documents are archived under their readable /w/ identity, if at all.
   const lookupUrl = namuReadableDocumentUrl(url);
   let closest;
   const availabilityController = new AbortController();
-  const availabilityTimer = setTimeout(() => availabilityController.abort(), WAYBACK_AVAILABILITY_TIMEOUT_MS);
+  const availabilityTimeout = deadline
+    ? Math.min(WAYBACK_AVAILABILITY_TIMEOUT_MS, deadline.remaining())
+    : WAYBACK_AVAILABILITY_TIMEOUT_MS;
+  const availabilityTimer = setTimeout(() => availabilityController.abort(), availabilityTimeout);
   try {
     const res = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(lookupUrl)}`, {
       headers: { "User-Agent": USER_AGENTS[1], Accept: "application/json" },
       signal: availabilityController.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      warnings.push(`Wayback 조회 실패: HTTP ${res.status}`);
+      recordDeadlineStage(deadline, "wayback", stageStart, false, `HTTP ${res.status}`);
+      return null;
+    }
     closest = (await res.json())?.archived_snapshots?.closest;
   } catch (err) {
-    warnings.push(`Wayback 조회 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    const note = err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120);
+    warnings.push(`Wayback 조회 실패: ${note}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, note);
     return null;
   } finally {
     clearTimeout(availabilityTimer);
   }
-  if (!closest?.available || String(closest.status) !== "200" || !closest.url) return null;
+  if (!closest?.available || String(closest.status) !== "200" || !closest.url) {
+    warnings.push("Wayback: 이 URL의 캡처 없음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "no capture");
+    return null;
+  }
   // The archive answers near-miss URLs too; only the requested document will
   // do, for the same reason as the search fallback below.
-  if (!sameDocument(lookupUrl, waybackOriginalUrl(closest.url))) return null;
+  if (!sameDocument(lookupUrl, waybackOriginalUrl(closest.url))) {
+    warnings.push("Wayback: 가장 가까운 캡처가 다른 문서라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "different document");
+    return null;
+  }
 
   const snapshotUrl = String(closest.url)
     .replace(/^http:\/\//i, "https://")
     .replace(/(\/web\/\d{4,14})\//, "$1id_/");
-  if (!isSafeFetchUrl(snapshotUrl)) return null;
+  if (!isSafeFetchUrl(snapshotUrl)) {
+    warnings.push("Wayback: 가장 가까운 캡처가 다른 문서라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "unsafe snapshot URL");
+    return null;
+  }
 
   let page;
   const snapshotController = new AbortController();
-  const snapshotTimer = setTimeout(() => snapshotController.abort(), WAYBACK_SNAPSHOT_TIMEOUT_MS);
+  const snapshotTimeout = deadline
+    ? Math.min(WAYBACK_SNAPSHOT_TIMEOUT_MS, deadline.remaining())
+    : WAYBACK_SNAPSHOT_TIMEOUT_MS;
+  const snapshotTimer = setTimeout(() => snapshotController.abort(), snapshotTimeout);
   try {
     page = await fetchOnce(snapshotUrl, USER_AGENTS[1], snapshotController.signal, new Map(), "auto");
   } catch (err) {
-    warnings.push(`Wayback 스냅샷 fetch 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    const note = err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120);
+    warnings.push(`Wayback 스냅샷 fetch 실패: ${note}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, note);
     return null;
   } finally {
     clearTimeout(snapshotTimer);
   }
-  if (!(page.status >= 200 && page.status < 300) || !page.body) return null;
+  if (!(page.status >= 200 && page.status < 300) || !page.body) {
+    warnings.push(`Wayback 스냅샷 응답 이상: HTTP ${page.status}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, `HTTP ${page.status}`);
+    return null;
+  }
   // The archive faithfully replays whatever it crawled — including an archived
   // challenge page. That capture proves nothing except that the WAF was on.
-  if (looksBlocked(200, page.body, lookupUrl)) return null;
+  if (looksBlocked(200, page.body, lookupUrl)) {
+    warnings.push("Wayback: 캡처가 차단 페이지라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "blocked capture");
+    return null;
+  }
 
   // Extract with the ORIGINAL url so the site preset (namu, news, …) applies
   // and relative links resolve against the origin, not web.archive.org.
   const sitePage = extractSitePage(lookupUrl, page.body, opts.site_preset, opts.cleaning_mode, opts);
   const text = sitePage?.text
     || htmlToText(page.body, opts.cleaning_mode, { include_links: opts.include_links, base_url: lookupUrl });
-  if (!sitePage && !hasMeaningfulHtmlContent(page.body, text)) return null;
+  if (!sitePage && !hasMeaningfulHtmlContent(page.body, text)) {
+    warnings.push("Wayback: 캡처에 본문 없음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "no content");
+    return null;
+  }
 
   const timestamp = String(closest.timestamp || "");
   const capturedAt = timestamp.length >= 8
     ? `${timestamp.slice(0, 4)}-${timestamp.slice(4, 6)}-${timestamp.slice(6, 8)}`
     : "unknown";
   warnings.push(`직접 fetch가 차단되어 Wayback Machine 스냅샷(${capturedAt} 캡처)으로 대체: ${snapshotUrl} — 캡처 이후의 편집은 반영되지 않습니다.`);
+  recordDeadlineStage(deadline, "wayback", stageStart, true);
 
   const meta = sitePage?.meta || extractMetadata(page.body);
   for (const field of ["title", "author", "published"]) {
@@ -3590,9 +3673,9 @@ async function tryWaybackSnapshot(url, opts, warnings, attemptTotal) {
 // Every direct attempt is spent. Walk the remaining ladder — document handling,
 // the paid Perplexity site: fallback, page metadata — and return whatever still
 // carries information, rather than nothing at all. Caller applies finish().
-async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags }) {
+async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags, deadline }) {
   if (flags.document) {
-    const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+    const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings, deadline);
     if (remote) {
       return {
         ok: true,
@@ -3632,7 +3715,7 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
   // age-gated pages are skipped: their captures are the gate itself.
   const tryWayback = async () => {
     if (flags.steamAgeGate) return null;
-    const archived = await tryWaybackSnapshot(url, opts, warnings, attemptTotal);
+    const archived = await tryWaybackSnapshot(url, opts, warnings, attemptTotal, deadline);
     if (!archived) return null;
     return {
       ...archived,
@@ -3646,7 +3729,7 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
   }
 
   // Paid, but works on Cloudflare-protected SPAs that pre-render for no UA.
-  const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+  const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings, deadline);
   if (remote) {
     return {
       ok: true,
@@ -3708,8 +3791,13 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   const cached = await readFetchCache(url, normalizedOpts);
   if (cached) return cached;
 
+  const deadline = createDeadline(opts.deadline_ms ?? FETCH_DEADLINE_MS);
   const overallController = new AbortController();
-  const overallTimer = setTimeout(() => overallController.abort(), FETCH_TOTAL_BUDGET_MS);
+  const overallTimer = setTimeout(
+    () => overallController.abort(),
+    Math.min(FETCH_TOTAL_BUDGET_MS, deadline.remaining())
+  );
+  const directStartedAt = Date.now();
 
   let lastStatus = 0;
   let lastBody = "";
@@ -3719,6 +3807,8 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   let blockedSeen = false;
   let steamAgeGateSeen = false;
   let documentSeen = false;
+  let timedOutSeen = false;
+  let directStageRecorded = false;
   const warnings = [];
   const cookieJar = new Map();
   const debugInfo = {
@@ -3729,6 +3819,13 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
     cache: "miss",
     attempts: [],
     clientRedirects: [],
+    stages: [],
+  };
+  deadline.stages = debugInfo.stages;
+  const recordDirectStage = (ok) => {
+    if (directStageRecorded) return;
+    directStageRecorded = true;
+    debugInfo.stages.push({ stage: "direct", ms: Date.now() - directStartedAt, ok });
   };
   applySitePresetCookies(cookieJar, normalizedOpts.site_preset);
   const userAgents = userAgentsForSitePreset(normalizedOpts.site_preset);
@@ -3738,6 +3835,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   }
 
   const finish = async (result) => {
+    recordDirectStage(true);
     const enriched = {
       ...result,
       attempt_total: result.attempt_total || userAgents.length,
@@ -3757,14 +3855,18 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   try {
     if (normalizedOpts.site_preset === "sourceforge") {
       const page = await trySourceForgeAlluraRest(url, normalizedOpts, overallController.signal, warnings, debugInfo);
-      if (page) return finish(page);
+      if (page) {
+        recordDirectStage(true);
+        return finish(page);
+      }
     }
 
     for (let i = 0; i < userAgents.length; i++) {
       if (overallController.signal.aborted) break;
 
       const attemptController = new AbortController();
-      const attemptTimer = setTimeout(() => attemptController.abort(), FETCH_PER_ATTEMPT_MS);
+      const attemptTimeout = opts.attempt_timeout_ms ?? FETCH_PER_ATTEMPT_MS;
+      const attemptTimer = setTimeout(() => attemptController.abort(), attemptTimeout);
       const composite = new AbortController();
       const onAbort = () => composite.abort();
       overallController.signal.addEventListener("abort", onAbort);
@@ -3790,6 +3892,10 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           redirectCount++;
         }
       } catch (err) {
+        const attemptTimedOut = err?.name === "AbortError"
+          && attemptController.signal.aborted
+          && !overallController.signal.aborted;
+        if (attemptTimedOut) timedOutSeen = true;
         warnings.push(`UA #${i + 1} 실패: ${err && err.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
       } finally {
         clearTimeout(attemptTimer);
@@ -3813,6 +3919,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         contentLength,
         bodyChars: body.length,
       });
+      if (timedOutSeen) break;
 
       if (status >= 200 && status < 300 && isDocumentResponse(lastFinalUrl, contentType)) {
         documentSeen = true;
@@ -3853,10 +3960,16 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         continue;
       }
 
+      if (overallController.signal.aborted) {
+        timedOutSeen = true;
+        break;
+      }
+
       if (normalizedOpts.site_preset === "sage" && body) {
         const sageArticle = extractSageArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts);
         if (sageArticle) {
           if (status >= 400) warnings.push(`UA #${i + 1}: extracted SAGE article body despite HTTP ${status}`);
+          recordDirectStage(true);
           return finish({
             ok: true,
             text: sageArticle.text,
@@ -3900,6 +4013,11 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           overallController.signal.removeEventListener("abort", onChallengeAbort);
           challengeController.signal.removeEventListener("abort", onChallengeAbort);
         }
+      }
+
+      if (overallController.signal.aborted) {
+        timedOutSeen = true;
+        break;
       }
 
       if (looksBlocked(status, body, lastFinalUrl)) {
@@ -3950,6 +4068,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           if (dcComments) {
             structured = { ...(structured || {}), comment_count: dcComments.total, comments: dcComments.items };
           }
+          recordDirectStage(true);
           return finish({
             ok: true,
             text,
@@ -3970,6 +4089,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         continue;
       }
     }
+
+    if (overallController.signal.aborted) timedOutSeen = true;
+    recordDirectStage(false);
 
     if (normalizedOpts.site_preset === "sage") {
       const article = await trySagePmcMirror(url, normalizedOpts, overallController.signal, warnings, userAgents.length);
@@ -3996,7 +4118,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         blocked: blockedSeen,
         steamAgeGate: steamAgeGateSeen,
         document: documentSeen,
+        timedOut: timedOutSeen,
       },
+      deadline,
     }));
   } finally {
     clearTimeout(overallTimer);
@@ -4119,7 +4243,7 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
   return { text: parts.join("\n").slice(0, maxChars), reason: "", url: entry.url };
 }
 
-async function fetchViaPerplexity(url, maxChars, apiKey) {
+async function fetchViaPerplexity(url, maxChars, apiKey, deadline) {
   let host, segments;
   try {
     const u = new URL(url);
@@ -4158,6 +4282,10 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
   for (const keywords of candidates) {
     const query = keywords.slice(0, 200).trim();
     if (!query || isOpaqueSlug(query)) continue;
+    const timeout = deadline
+      ? Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000)
+      : SEARCH_FALLBACK_TIMEOUT_MS;
+    if (timeout < 4_000) break;
     try {
       // Use official search_domain_filter (allowlist for the host) instead of `site:` query operator.
       // Ask for several results: the requested document is not always ranked first.
@@ -4166,7 +4294,7 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
         max_results: 5,
         max_tokens_per_page: 2048,
         search_domain_filter: [host],
-      }, apiKey, SEARCH_FALLBACK_TIMEOUT_MS);
+      }, apiKey, timeout);
       const data = await response.json();
       const results = Array.isArray(data?.results) ? data.results : [];
       // Only the requested document will do. A near-miss on the same domain is
@@ -4210,33 +4338,64 @@ function paginateText(text, pageSize, requestedPage) {
 
 // ── Perplexity /search ──────────────────────────────────────────────
 
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let sleep = defaultSleep;
+
+function __setSleepForTests(fn) {
+  sleep = typeof fn === "function" ? fn : defaultSleep;
+}
+
 async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "User-Agent": `perplexity-mcp/${VERSION}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      let errorText;
-      try { errorText = await res.text(); } catch { errorText = "Unable to parse error response"; }
-      throw new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${errorText}`);
-    }
-    return res;
-  } catch (err) {
-    if (err && err.name === "AbortError") {
+  const end = Date.now() + timeoutMs;
+  let retries = 0;
+  let last429Error = null;
+
+  while (true) {
+    const remaining = end - Date.now();
+    if (remaining <= 0) {
+      if (last429Error) throw last429Error;
       throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
     }
-    throw err;
-  } finally {
-    clearTimeout(timer);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    let res;
+    try {
+      res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "User-Agent": `perplexity-mcp/${VERSION}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.ok) return res;
+
+    let errorText;
+    try { errorText = await res.text(); } catch { errorText = "Unable to parse error response"; }
+    const error = new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${errorText}`);
+    if (res.status !== 429 || retries >= 2) throw error;
+    last429Error = error;
+
+    const retryAfterHeader = res.headers.get("retry-after");
+    const retryAfter = Number(retryAfterHeader);
+    const backoff = retryAfterHeader !== null && Number.isFinite(retryAfter) && retryAfter >= 0
+      ? retryAfter * 1_000
+      : 1_000 * 2 ** retries + Math.floor(Math.random() * 400);
+    retries++;
+    await sleep(Math.min(4_000, backoff, Math.max(0, end - Date.now())));
+    if (end - Date.now() < 2_000) throw last429Error;
   }
 }
 
@@ -4510,6 +4669,7 @@ function formatDebugBlock(debugInfo) {
     `  cleaned_chars: ${debugInfo.cleanedChars ?? "n/a"}`,
     debugInfo.clientRedirects?.length ? `  client_redirects: ${debugInfo.clientRedirects.map((r) => `${r.kind}:${r.to}`).join(" | ")}` : null,
     debugInfo.attempts?.length ? `  attempts: ${debugInfo.attempts.map((a) => `#${a.ua}${a.urlKind ? ` ${a.urlKind}` : ""} ${a.status} ${a.contentType || "unknown"} ${a.bodyChars} chars`).join(" | ")}` : null,
+    debugInfo.stages?.length ? `  stages: ${debugInfo.stages.map((s) => `${s.stage} ${s.ms}ms ${s.ok ? "ok" : `fail${s.note ? `(${s.note})` : ""}`}`).join(" | ")}` : null,
   ].filter(Boolean).join("\n");
 }
 
@@ -4573,12 +4733,16 @@ function formatFetchResult(url, result, opts = {}) {
 }
 
 async function fetchAndFormat(url, apiKey, opts = {}) {
+  const toolStart = opts.tool_started_at ?? Date.now();
   const result = await fetchPageWithFallbacks(url, apiKey, opts);
   let text = formatFetchResult(url, result, opts);
   let imageContent = [];
-  if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length) {
+  const imageBudget = Math.min(IMAGE_FETCH_BUDGET_MS, TOOL_DEADLINE_MS - (Date.now() - toolStart));
+  if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length && imageBudget < 2_000) {
+    text += "\n\n[이미지 첨부 생략: 시간 예산 부족]";
+  } else if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_BUDGET_MS);
+    const timer = setTimeout(() => controller.abort(), imageBudget);
     try {
       const { blocks, images, notes } = await collectImageBlocks(result.imageUrls, result.finalUrl || url, controller.signal, opts);
       imageContent = blocks;
@@ -4924,7 +5088,7 @@ function createServer(apiKey) {
       outputSchema: FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      const opts = normalizeFetchOpts(args);
+      const opts = normalizeFetchOpts(args, { tool_started_at: Date.now() });
       const { result, text, imageContent } = await fetchAndFormat(args.url, apiKey, opts);
       const structuredContent = buildFetchStructured(args.url, result, text, opts);
       // Text first, then any image blocks collected for multimodal clients.
@@ -4943,27 +5107,34 @@ function createServer(apiKey) {
       outputSchema: FETCH_MANY_OUTPUT_SHAPE,
     },
     async (args) => {
-      const parts = [];
-      const items = [];
-      for (let i = 0; i < args.urls.length; i++) {
-        const url = args.urls[i];
+      const toolStart = Date.now();
+      const entries = await Promise.all(args.urls.map(async (url, i) => {
         try {
-          const opts = normalizeFetchOpts(args, { max_chars: args.max_chars ?? 4000 });
+          const opts = normalizeFetchOpts(args, {
+            max_chars: args.max_chars ?? 4000,
+            tool_started_at: toolStart,
+          });
           const { result, text } = await fetchAndFormat(url, apiKey, opts);
-          parts.push(`## [${i + 1}] ${url}\n\n${text}`);
-          items.push(buildFetchStructured(url, result, text, opts).result);
+          return {
+            part: `## [${i + 1}] ${url}\n\n${text}`,
+            item: buildFetchStructured(url, result, text, opts).result,
+          };
         } catch (err) {
           const errorText = `Error: ${String(err).slice(0, 500)}`;
-          parts.push(`## [${i + 1}] ${url}\n\n${errorText}`);
-          items.push({
-            url,
-            source: "error",
-            text: errorText,
-            metadata: {},
-            warnings: [errorText],
-          });
+          return {
+            part: `## [${i + 1}] ${url}\n\n${errorText}`,
+            item: {
+              url,
+              source: "error",
+              text: errorText,
+              metadata: {},
+              warnings: [errorText],
+            },
+          };
         }
-      }
+      }));
+      const parts = entries.map((entry) => entry.part);
+      const items = entries.map((entry) => entry.item);
       const text = parts.join("\n\n---\n\n");
       const structuredContent = { text, count: items.length, items };
       return { content: [{ type: "text", text }], structuredContent };
@@ -4978,6 +5149,7 @@ function createServer(apiKey) {
       outputSchema: SEARCH_FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
+      const toolStart = Date.now();
       const opts = normalizeSearchOpts(args, {
         max_results: args.max_results ?? Math.max(8, args.fetch_top_k ?? 3),
       });
@@ -4992,13 +5164,16 @@ function createServer(apiKey) {
         "",
         `# Fetched top ${topK}`,
       ];
-      const fetchedItems = [];
-      for (let i = 0; i < topK; i++) {
-        const result = search.results[i];
+      const fetchDeadline = Math.max(
+        15_000,
+        TOOL_DEADLINE_MS - (Date.now() - toolStart) - 5_000
+      );
+      const fetchedEntries = await Promise.all(search.results.slice(0, topK).map(async (result, i) => {
         try {
           // Explicit allowlist, not a spread: search arguments such as query
           // and fetch_top_k must not leak into the fetch options.
           const fetchOpts = normalizeFetchOpts({
+            url: result.url,
             max_chars: args.fetch_chars ?? 3500,
             page: 1,
             cleaning_mode: args.cleaning_mode,
@@ -5007,22 +5182,28 @@ function createServer(apiKey) {
             include_links: args.include_links,
             debug: args.debug,
             use_cache: args.use_cache,
-          });
+          }, { deadline_ms: fetchDeadline, tool_started_at: toolStart });
           const fetched = await fetchAndFormat(result.url, apiKey, fetchOpts);
-          chunks.push(`\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`);
-          fetchedItems.push(buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result);
+          return {
+            chunk: `\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`,
+            item: buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result,
+          };
         } catch (err) {
           const errorText = `Error: ${String(err).slice(0, 500)}`;
-          chunks.push(`\n## [${i + 1}] ${result.url}\n${errorText}`);
-          fetchedItems.push({
-            url: result.url || "",
-            source: "error",
-            text: errorText,
-            metadata: {},
-            warnings: [errorText],
-          });
+          return {
+            chunk: `\n## [${i + 1}] ${result.url}\n${errorText}`,
+            item: {
+              url: result.url || "",
+              source: "error",
+              text: errorText,
+              metadata: {},
+              warnings: [errorText],
+            },
+          };
         }
-      }
+      }));
+      chunks.push(...fetchedEntries.map((entry) => entry.chunk));
+      const fetchedItems = fetchedEntries.map((entry) => entry.item);
       const text = chunks.join("\n");
       const searchText = formatSearchResults(search, { debug: args.debug });
       const structuredContent = {
@@ -5112,6 +5293,8 @@ export {
   extractClientRedirect,
   looksBlocked,
   looksSteamAgeGate,
+  createDeadline,
+  degradationCause,
   buildSimpleChallengeSubmission,
   buildSteamAgeSubmission,
   hasMeaningfulHtmlContent,
@@ -5147,6 +5330,7 @@ export {
   runSearch,
   performSearch,
   makeApiRequest,
+  __setSleepForTests,
 
   // Fetch shaping
   formatFetchResult,
