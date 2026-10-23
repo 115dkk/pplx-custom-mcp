@@ -275,3 +275,44 @@ test("Reddit archive retries with a second identity and reports a refused reques
     stub.restore();
   }
 });
+
+test("Reddit archive waits out a rate-limit window that is about to end, and only then", async () => {
+  const { __setSleepForTests } = await import("../src/index.js");
+  const postsUrl = "https://arctic-shift.photon-reddit.com/api/posts/ids?ids=1fp5gut";
+  const commentsUrl = "https://arctic-shift.photon-reddit.com/api/comments/tree?link_id=1fp5gut&limit=200";
+  const waits = [];
+  __setSleepForTests(async (ms) => { waits.push(ms); });
+  const original = globalThis.fetch;
+  try {
+    // First call per URL: 429 with a 2 s window; afterwards the archive answers.
+    const seen = new Map();
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      const count = (seen.get(url) || 0) + 1;
+      seen.set(url, count);
+      if (count === 1) return new Response("slow down", { status: 429, headers: { "x-ratelimit-reset": "2" } });
+      const body = url.startsWith(postsUrl) ? fixture("reddit-archive-post.json") : fixture("reddit-archive-comments.json");
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const page = await fetchRedditArchive(REDDIT_URL, {});
+    assert.match(page.text, /Archive fixture post/);
+    assert.ok(waits.length >= 1 && waits.every((ms) => ms === 2_250));
+    assert.equal(seen.get(postsUrl), 2, "a rate limit is retried once, with the same identity");
+
+    // A window that ends far in the future is not waited for, and no second
+    // identity is spent on it.
+    waits.length = 0;
+    seen.clear();
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      seen.set(url, (seen.get(url) || 0) + 1);
+      return new Response("slow down", { status: 429, headers: { "x-ratelimit-reset": "46" } });
+    };
+    await assert.rejects(fetchRedditArchive(REDDIT_URL, {}), /HTTP 429/);
+    assert.equal(waits.length, 0);
+    assert.equal(seen.get(postsUrl), 1);
+  } finally {
+    globalThis.fetch = original;
+    __setSleepForTests(null);
+  }
+});
