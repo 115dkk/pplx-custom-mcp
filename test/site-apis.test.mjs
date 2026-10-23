@@ -35,7 +35,8 @@ test("Hacker News item formats metadata, comments, and story link", () => {
   assert.match(page.text, /\n  second line/);
   assert.doesNotMatch(page.text, /deleted/);
   assert.equal(page.structured.num_comments, 3, "full descendant count includes a deleted node");
-  assert.equal(page.structured.comments.length, 2);
+  assert.equal(page.structured.comments_shown, 2);
+  assert.equal(page.structured.comments, undefined, "the comment tree is the body; structured data must not repeat it");
 });
 
 test("Hacker News front page preserves order and can omit all URLs", () => {

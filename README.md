@@ -18,7 +18,7 @@ JS로 렌더링되는 콘텐츠를 헤드리스 브라우저로 뜯는 대신, *
 
 ---
 
-## 도구 (v1.3.0)
+## 도구 (v1.4.0)
 
 네 개 모두 `outputSchema`를 선언하고 사람이 읽는 텍스트와 `structuredContent`를 함께 돌려줍니다.
 
@@ -45,7 +45,10 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 | 사이트 | 하는 일 |
 |---|---|
 | DCinside | 모바일 URL 변환, `dcinside.app` UA, 로그인·광고 리다이렉트 싱크 차단, 댓글 XHR 재현, 본문 이미지 자동 첨부 |
-| Reddit | HTML이 봇 검증에 걸리면 공개 `.json?raw_json=1`로 폴백, 본문+댓글 트리 추출 |
+| Reddit | HTML이 봇 검증에 걸리면 공개 `.json?raw_json=1`로 폴백, 본문+댓글 트리 추출. Reddit은 Worker·Perplexity·Wayback을 모두 막으므로, 글 URL이면 유료 호출 전에 Arctic Shift 공개 아카이브(무료, 점수·댓글은 수집 시점 기준)에서 같은 모양의 JSON을 받아 같은 추출기로 처리 |
+| Hacker News | HTML이 Worker에 419를 돌려주므로 항목(`/item?id=`)과 첫 페이지는 처음부터 Algolia 공식 API로 가져옴. 댓글 트리를 들여쓰기로 보존 |
+| Stack Exchange | Stack Overflow 등 Stack Exchange 계열 질문(`/questions/<id>`, `/q/`, `/a/`)은 Cloudflare 챌린지 대신 공식 API로 질문과 투표순 답변 10개를 가져옴 |
+| YouTube | 시청 페이지의 `ytInitialPlayerResponse`에서 제목·채널·게시일·길이·조회수·설명을 추출. Worker가 429를 받으면 Wayback 캡처에서 같은 데이터를 읽음 |
 | 나무위키 | VPN/IDC 공지, `[편집]` 마커, 분류·네비게이션 상자, 목차 제거. `/raw/`는 동일 `rev`의 `/w/` 읽기 URL로 바꾸고 공식 `Perplexity-User` UA로 Worker에서 직접 확인. 직접 경로가 막히면 Wayback Machine 최신 캡처(무료)를 먼저 시도하고, 이어서 Agent·검색 폴백 사용 |
 | MediaWiki | `mw-content-text` 추출, 목차·편집 링크·알림 상자·썸네일 캡션 제거 |
 | SAGE Journals | 인용 메타 + 초록/전문 추출, 막히면 DOI로 PMC 오픈액세스 미러 폴백 |
@@ -53,17 +56,21 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 | 뉴스 | 국내외 주요 언론사 도메인 레지스트리, 레거시 한글 인코딩 디코딩, JSON-LD/Arc/일반 본문 추출, 공유·폰트·로그인·광고·관련기사 제거 |
 | Steam | 성인 연령 확인 폼 자동 통과, 앱 ID/이름/출시일/가격/태그 구조화 |
 
-그 외 공통: UA 로테이션, 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적, 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용. 직접 fetch가 403·봇 차단·빈 SPA 셸로 끝나면 `fetch_url`로 정확한 URL의 본문을 요청하고, 거부·오류·타임아웃이면 기존 Perplexity 검색 폴백으로 이어집니다. 유료 경로까지 실패하면 Wayback Machine 최신 캡처를 무료 백스톱으로 시도합니다(나무위키는 유료 호출보다 먼저 아카이브 조회).
+그 외 공통: UA 로테이션(Chrome 157·iOS Safari 26, `sec-ch-ua`는 Chromium GREASE 규칙으로 계산), 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적(JS 리다이렉트는 본문이 거의 없는 중간 페이지에서만 따름), 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용. 직접 fetch가 403·봇 차단·빈 SPA 셸로 끝나면 `fetch_url`로 정확한 URL의 본문을 요청하고, 거부·오류·타임아웃이면 기존 Perplexity 검색 폴백으로 이어집니다. 유료 경로까지 실패하면 Wayback Machine 최신 캡처를 무료 백스톱으로 시도합니다(나무위키는 유료 호출보다 먼저 아카이브 조회).
 
 Worker의 직접 fetch는 `robots.txt`를 요청하거나 적용하지 않습니다. 크롤러가 아니라 사용자가 지목한 URL 하나를 확인하는 fetch 유틸이기 때문입니다. 나무위키 `/raw/`는 사이트가 과거판 경로를 별도로 차단하므로 동일 문서·동일 `rev`의 `/w/` 읽기 URL로 바꾼 뒤, 사용자 요청용 공식 `Perplexity-User` UA를 먼저 써서 Worker가 직접 가져옵니다. 직접 경로도 막힌 경우에만 Perplexity `fetch_url`과 동일 문서 검증 검색 폴백이 이어지며, 현재판이나 다른 `rev`가 돌아오면 폐기합니다.
 
 나무위키 WAF가 UA와 출구 IP를 함께 검증하는 시점에는 Workers, Cloudflare Browser Run, Perplexity `fetch_url`이 모두 거절될 수 있습니다. 이때는 Wayback Machine의 최신 캡처를 무료 폴백으로 사용합니다: 나무위키 URL은 유료 호출보다 먼저 아카이브를 조회하고(그 외 사이트는 유료 경로가 최신본을 주므로 유료 실패 후의 백스톱), `id_` 플래그로 원본 마크업을 받아 나무위키 추출기를 그대로 적용하며, 캡처 날짜를 본문 헤더와 경고에 명시합니다. 캡처가 요청한 문서와 다르거나 캡처 자체가 차단 페이지면 폐기합니다. 아카이브에도 없는 문서(특히 `rev=` 과거판)는 현재판을 과거판인 것처럼 반환하지 않고 실패를 명시합니다.
 
 ### `perplexity_fetch_many`
-알려진 URL을 최대 5개까지 한 번에 가져와 URL별 섹션으로 나눠 돌려줍니다.
+알려진 URL을 최대 5개까지 동시에 가져와 URL별 섹션으로 나눠 돌려줍니다.
 
 ### `perplexity_search_fetch`
-검색 → dedupe → 상위 K개 fetch를 한 번에. 증거 묶음이 필요할 때.
+검색 → dedupe → 상위 K개 동시 fetch를 한 번에. 증거 묶음이 필요할 때.
+
+### 시간 예산
+
+MCP 클라이언트는 도구 호출 하나를 60초 안팎에서 끊습니다. 그래서 fetch 한 건은 직접 시도와 모든 폴백을 합쳐 40초, 도구 호출 하나는 이미지 수집까지 합쳐 50초 안에 끝나도록 단계마다 남은 시간으로 타임아웃을 정하고, 시간이 모자란 단계는 경고를 남기고 건너뜁니다. 연결 자체가 응답하지 않으면 다른 UA로 바꿔도 소용이 없으므로 첫 타임아웃에서 직접 시도를 멈추고 폴백으로 넘어갑니다. Perplexity API의 429는 `Retry-After` 또는 지수 백오프로 두 번까지 다시 시도합니다. `debug=true`이면 단계별 소요 시간(`stages:`)이 함께 나옵니다.
 
 ---
 

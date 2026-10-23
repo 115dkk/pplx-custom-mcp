@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -2434,7 +2434,10 @@ async function tryRedditArchive(url, opts, warnings, attemptTotal, deadline) {
   opts.signal?.addEventListener?.("abort", onAbort, { once: true });
   try {
     const page = await fetchRedditArchive(url, opts, controller.signal);
-    if (!page) return null;
+    if (!page) {
+      warnings.push("Arctic Shift: 이 글의 아카이브 없음");
+      return null;
+    }
     warnings.push(`Reddit 직접 fetch가 차단되어 Arctic Shift 아카이브로 대체: ${page.apiUrl} — 점수와 댓글은 수집 시점 기준입니다.`);
     return {
       ok: true,
@@ -3665,12 +3668,18 @@ function hackerNewsCommentCount(children) {
   return count;
 }
 
+// HN separates paragraphs with a bare <p> and never closes it, so the generic
+// converter, which breaks lines on closing tags, would run them together.
+function hackerNewsHtmlToText(html, mode, linkOpts) {
+  return htmlToText(String(html || "").replace(/<p>/gi, "\n\n"), mode, linkOpts);
+}
+
 function extractHackerNewsItemData(url, json, opts = {}) {
   if (!isHackerNewsUrl(url) || !json || !json.id) return null;
   const mode = opts.cleaning_mode || "balanced";
   const linkOpts = { include_links: opts.include_links !== false, base_url: url };
   const title = cleanText(json.title || (json.author ? `Comment by ${json.author}` : "Hacker News item"), mode);
-  const body = htmlToText(json.text || "", mode, linkOpts);
+  const body = hackerNewsHtmlToText(json.text, mode, linkOpts);
   const numComments = hackerNewsCommentCount(json.children);
   const comments = [];
 
@@ -3678,7 +3687,7 @@ function extractHackerNewsItemData(url, json, opts = {}) {
     if (depth > 10 || comments.length >= 200) return;
     for (const child of Array.isArray(children) ? children : []) {
       if (comments.length >= 200) break;
-      const commentBody = htmlToText(child?.text || "", mode, linkOpts);
+      const commentBody = hackerNewsHtmlToText(child?.text, mode, linkOpts);
       if (child?.author != null || child?.text != null) {
         comments.push({
           author: child?.author || "deleted",
@@ -3742,7 +3751,9 @@ function extractHackerNewsItemData(url, json, opts = {}) {
       story_id: storyId,
       parent_id: json.parent_id,
       num_comments: numComments,
-      comments: comments.slice(0, 50).map((comment) => compactObject(comment)),
+      // The comment tree is already the body; repeating it here would double
+      // the tokens, because the text header prints structured data in full.
+      comments_shown: comments.length,
     }),
   };
 }
@@ -4282,6 +4293,16 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
     if (archived) return archived;
   }
 
+  // Reddit refuses Workers and Perplexity's fetcher alike and keeps the
+  // Internet Archive out, so for a post the Arctic Shift archive comes before
+  // any paid call. Listings and other pages have no archive entry and skip it.
+  if (opts.site_preset === "reddit" && redditPostIdFromUrl(url)) {
+    const stageStart = Date.now();
+    const archived = await tryRedditArchive(url, opts, warnings, attemptTotal, deadline);
+    recordDeadlineStage(deadline, "reddit-archive", stageStart, !!archived);
+    if (archived) return archived;
+  }
+
   // Paid, but works on Cloudflare-protected SPAs that pre-render for no UA.
   const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings, deadline);
   if (remote) {
@@ -4413,6 +4434,14 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         recordDirectStage(true);
         return finish(page);
       }
+    }
+
+    // Hacker News and Stack Exchange refuse Worker egress outright, so their
+    // official APIs go first, like SourceForge's REST endpoint above.
+    const apiPage = await trySiteApiFirst(url, normalizedOpts, overallController.signal, warnings, debugInfo);
+    if (apiPage) {
+      recordDirectStage(true);
+      return finish(apiPage);
     }
 
     for (let i = 0; i < userAgents.length; i++) {
@@ -5375,6 +5404,7 @@ const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
   "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
+  "Hacker News items and Stack Exchange questions are read through their official APIs (source: hn-algolia / stackexchange-api); blocked Reddit posts come from the Arctic Shift archive (source: reddit-archive, scores and comments as of capture); YouTube watch pages include the video description.",
   "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
   "If the body exceeds max_chars, call again with the same URL and page+1.",
 ].join(" ");
@@ -5728,6 +5758,9 @@ function createServer(apiKey) {
           // and fetch_top_k must not leak into the fetch options.
           const fetchOpts = normalizeFetchOpts({
             url: result.url,
+            // Only text reaches this tool's output, so DCinside's automatic
+            // image attachment would be fetched and thrown away.
+            include_images: false,
             max_chars: args.fetch_chars ?? 3500,
             page: 1,
             cleaning_mode: args.cleaning_mode,
