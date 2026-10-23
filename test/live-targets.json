@@ -11,11 +11,11 @@
       "must_contain": ["Team Fortress"]
     },
     {
-      "//": "GitHub usually serves the Worker directly but intermittently rate-limits it, so both paths are accepted here. Steam, Cloudflare Docs and Wikipedia are the strict direct-path targets.",
+      "//": "GitHub usually serves the Worker directly but intermittently rate-limits it, so the remote paths are accepted here too (fetch_url since 2026-10-23, when it began answering for GitHub). Steam, Cloudflare Docs and Wikipedia are the strict direct-path targets.",
       "name": "github repository page",
       "url": "https://github.com/cloudflare/workers-sdk",
       "min_body_chars": 800,
-      "expect_source": ["direct", "perplexity"],
+      "expect_source": ["direct", "agent-fetch-url", "perplexity"],
       "must_contain": ["workers-sdk"]
     },
     {
