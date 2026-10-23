@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.4.2";
+const VERSION = "1.4.3";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -2487,6 +2487,8 @@ function extractRedditPostData(url, body, opts = {}) {
   };
 }
 
+const ARCHIVE_RATE_LIMIT_MAX_WAIT_S = 5;
+
 const ARCHIVE_API_USER_AGENTS = [
   `perplexity-mcp/${VERSION} (+https://github.com/115dkk/pplx-custom-mcp)`,
   USER_AGENTS[0],
@@ -2525,11 +2527,21 @@ async function fetchRedditArchive(url, opts = {}, signal) {
   // their headers; a second identity is tried before giving up.
   const read = async (target) => {
     let lastStatus = 0;
-    for (const ua of ARCHIVE_API_USER_AGENTS) {
-      const response = await fetch(target, { headers: { Accept: "application/json", "User-Agent": ua }, signal });
+    let waitedForWindow = false;
+    for (let i = 0; i < ARCHIVE_API_USER_AGENTS.length; i++) {
+      const response = await fetch(target, { headers: { Accept: "application/json", "User-Agent": ARCHIVE_API_USER_AGENTS[i] }, signal });
       if (response.ok) return response.json();
       lastStatus = response.status;
       try { await response.body?.cancel?.(); } catch { /* already closed */ }
+      if (response.status !== 429) continue;
+      // The limit is a per-minute window per IP, shared with everyone else on
+      // Cloudflare's egress IPs. Another identity does not help; waiting does,
+      // but only when the window ends within a few seconds.
+      const reset = Number(response.headers.get("x-ratelimit-reset") ?? response.headers.get("retry-after"));
+      if (waitedForWindow || !Number.isFinite(reset) || reset < 0 || reset > ARCHIVE_RATE_LIMIT_MAX_WAIT_S) break;
+      waitedForWindow = true;
+      await sleep(reset * 1_000 + 250);
+      i--;
     }
     throw new Error(`HTTP ${lastStatus}`);
   };
