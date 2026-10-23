@@ -1638,6 +1638,14 @@ function safeResolveUrl(baseUrl, candidate) {
   return "";
 }
 
+// Interstitial redirect pages say "redirecting…" and little else; a page with
+// an article on it is not one, whatever its scripts do.
+const CLIENT_REDIRECT_PAGE_TEXT_LIMIT = 600;
+
+function roughVisibleTextLength(html) {
+  return stripRawTextElements(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().length;
+}
+
 function extractClientRedirect(baseUrl, html) {
   for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
     const tag = match[0];
@@ -1650,17 +1658,28 @@ function extractClientRedirect(baseUrl, html) {
     }
   }
 
+  // A script assignment is only a redirect when it is the page's whole job.
+  // Tistory blogs put `window.location.href = '/search' + '/' + query` in the
+  // search box's onkeypress handler, and following that replaced every post
+  // with the blog's empty search page. So: inline <script> bodies only, the
+  // literal must be the entire right-hand side, and the page itself must be
+  // close to empty, as interstitials are.
   const jsPatterns = [
-    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["'][ \t]*(?=[;}\r\n]|$)/i,
     /(?:window\.)?location\.replace\(\s*["']([^"']+)["']\s*\)/i,
-    /document\.location\s*=\s*["']([^"']+)["']/i,
+    /document\.location\s*=\s*["']([^"']+)["'][ \t]*(?=[;}\r\n]|$)/i,
   ];
   const scan = html.slice(0, 40_000);
+  const scripts = [...scan.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)].map((m) => m[1]).join("\n");
+  if (!scripts) return null;
   for (const re of jsPatterns) {
-    const match = scan.match(re);
+    const match = scripts.match(re);
     if (!match) continue;
-    const target = safeResolveUrl(baseUrl, match[1]);
-    if (target) return { url: target, kind: "javascript-redirect" };
+    // Naver escapes slashes inside the literal: 'https:\/\/m.blog.naver.com\/…'.
+    const target = safeResolveUrl(baseUrl, match[1].replace(/\\\//g, "/"));
+    if (!target) continue;
+    if (roughVisibleTextLength(html) > CLIENT_REDIRECT_PAGE_TEXT_LIMIT) return null;
+    return { url: target, kind: "javascript-redirect" };
   }
   return null;
 }
