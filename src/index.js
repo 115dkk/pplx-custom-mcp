@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.4.1";
+const VERSION = "1.4.2";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -4663,9 +4663,11 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
     cleaningMode: normalizedOpts.cleaning_mode,
     sitePreset: normalizedOpts.site_preset,
     cache: "miss",
-    attempts: [],
+    // The caller may hand in its own arrays so that a watchdog which gives
+    // up on this fetch can still report how far it got.
+    attempts: Array.isArray(opts.attempt_log) ? opts.attempt_log : [],
     clientRedirects: [],
-    stages: [],
+    stages: Array.isArray(opts.stage_log) ? opts.stage_log : [],
   };
   deadline.stages = debugInfo.stages;
   const recordDirectStage = (ok) => {
@@ -5598,9 +5600,49 @@ function formatFetchResult(url, result, opts = {}) {
   return `${header}\n\n${structured}${linksBlock}${pageInfo.text || "(empty body)"}${debugBlock}`;
 }
 
+// Every stage sizes its own timeout from the fetch deadline, but nothing made
+// the total binding: one await that ignores its abort signal kept a tool call
+// open past the client's timeout in production (180 s, no answer at all). The
+// watchdog answers on time whatever is still pending, and says how far the
+// fetch had got.
+const TOOL_WATCHDOG_MARGIN_MS = 2_000;
+
+function watchdogResult(url, startedAt, attempts, stages) {
+  const elapsed = Date.now() - startedAt;
+  const lastStage = stages.at(-1)?.stage || (attempts.length ? "direct" : "start");
+  return {
+    ok: false,
+    text: `[경고: ${Math.round(elapsed / 1000)}초 안에 응답이 끝나지 않아 중단했습니다(마지막 완료 단계: ${lastStage}). 잠시 뒤 같은 URL을 다시 요청하면 다른 경로로 성공할 수 있습니다.]`,
+    status: attempts.at(-1)?.status || 0,
+    attempt: attempts.length,
+    attempt_total: attempts.length,
+    warnings: [`도구 시간 예산 초과로 중단(${elapsed} ms, 마지막 완료 단계: ${lastStage})`],
+    partial: true,
+    source: "timeout",
+    meta: {},
+    finalUrl: url,
+    debugInfo: { requestedUrl: url, finalUrl: url, cache: "miss", attempts, clientRedirects: [], stages: [...stages, { stage: "watchdog", ms: elapsed, ok: false }] },
+  };
+}
+
 async function fetchAndFormat(url, apiKey, opts = {}) {
   const toolStart = opts.tool_started_at ?? Date.now();
-  const result = await fetchPageWithFallbacks(url, apiKey, opts);
+  const attemptLog = [];
+  const stageLog = [];
+  const watchdogMs = Math.max(1_000, TOOL_DEADLINE_MS + TOOL_WATCHDOG_MARGIN_MS - (Date.now() - toolStart));
+  let watchdogTimer;
+  const watchdog = new Promise((resolve) => {
+    watchdogTimer = setTimeout(() => resolve(watchdogResult(url, toolStart, attemptLog, stageLog)), watchdogMs);
+  });
+  let result;
+  try {
+    result = await Promise.race([
+      fetchPageWithFallbacks(url, apiKey, { ...opts, attempt_log: attemptLog, stage_log: stageLog }),
+      watchdog,
+    ]);
+  } finally {
+    clearTimeout(watchdogTimer);
+  }
   let text = formatFetchResult(url, result, opts);
   let imageContent = [];
   const imageBudget = Math.min(IMAGE_FETCH_BUDGET_MS, TOOL_DEADLINE_MS - (Date.now() - toolStart));
@@ -6184,6 +6226,7 @@ export {
   looksSteamAgeGate,
   createDeadline,
   createLimiter,
+  TOOL_DEADLINE_MS,
   degradationCause,
   buildSimpleChallengeSubmission,
   buildSteamAgeSubmission,

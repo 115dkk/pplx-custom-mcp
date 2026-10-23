@@ -4,7 +4,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { fetchPageWithFallbacks, extractHackerNewsItemData } from "../src/index.js";
+import { fetchPageWithFallbacks, fetchAndFormat, extractHackerNewsItemData, TOOL_DEADLINE_MS } from "../src/index.js";
 import { fixture, installFetch, OFFLINE } from "./helpers/harness.mjs";
 
 const json = (url, body, status = 200) => ({ url, body, status, headers: { "content-type": "application/json" } });
@@ -68,4 +68,29 @@ test("wiring: Hacker News paragraphs survive the bare <p> separators", () => {
     children: [],
   });
   assert.match(page.text, /First paragraph\.\n\nSecond paragraph\./);
+});
+
+test("wiring: the watchdog answers even when a request ignores its abort signal", async () => {
+  const original = globalThis.fetch;
+  // A fetch that never settles and never listens to its signal.
+  globalThis.fetch = () => new Promise(() => {});
+  try {
+    const started = Date.now();
+    const { result, text } = await fetchAndFormat("https://example.com/hangs", "", {
+      use_cache: false,
+      include_images: false,
+      debug: true,
+      // Short internal budgets so the abandoned fetch leaves no long timers.
+      deadline_ms: 300,
+      attempt_timeout_ms: 100,
+      // Pretend the tool call began just under the deadline ago.
+      tool_started_at: Date.now() - TOOL_DEADLINE_MS - 1_500,
+    });
+    assert.ok(Date.now() - started < 3_000, "the watchdog must answer within its margin");
+    assert.equal(result.source, "timeout");
+    assert.match(text, /응답이 끝나지 않아 중단/);
+    assert.ok(result.debugInfo.stages.some((stage) => stage.stage === "watchdog"));
+  } finally {
+    globalThis.fetch = original;
+  }
 });
