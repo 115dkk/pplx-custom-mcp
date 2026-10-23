@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -2487,6 +2487,11 @@ function extractRedditPostData(url, body, opts = {}) {
   };
 }
 
+const ARCHIVE_API_USER_AGENTS = [
+  `perplexity-mcp/${VERSION} (+https://github.com/115dkk/pplx-custom-mcp)`,
+  USER_AGENTS[0],
+];
+
 function redditPostIdFromUrl(url) {
   if (!isRedditUrl(url)) return "";
   try {
@@ -2516,14 +2521,21 @@ async function fetchRedditArchive(url, opts = {}, signal) {
   if (!id) return null;
   const postsUrl = `https://arctic-shift.photon-reddit.com/api/posts/ids?ids=${encodeURIComponent(id)}`;
   const commentsUrl = `https://arctic-shift.photon-reddit.com/api/comments/tree?link_id=${encodeURIComponent(id)}&limit=200`;
-  const headers = { Accept: "application/json", "User-Agent": DESKTOP_CHROME_UA };
+  // Arctic Shift sits behind Cloudflare, which judges Worker subrequests by
+  // their headers; a second identity is tried before giving up.
   const read = async (target) => {
-    const response = await fetch(target, { headers, signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return response.json();
+    let lastStatus = 0;
+    for (const ua of ARCHIVE_API_USER_AGENTS) {
+      const response = await fetch(target, { headers: { Accept: "application/json", "User-Agent": ua }, signal });
+      if (response.ok) return response.json();
+      lastStatus = response.status;
+      try { await response.body?.cancel?.(); } catch { /* already closed */ }
+    }
+    throw new Error(`HTTP ${lastStatus}`);
   };
   const [postsResult, commentsResult] = await Promise.allSettled([read(postsUrl), read(commentsUrl)]);
-  if (postsResult.status !== "fulfilled") return null;
+  // A failed request is not a missing post; let the caller report why.
+  if (postsResult.status !== "fulfilled") throw postsResult.reason;
   const post = postsResult.value?.data?.[0];
   if (!post || String(post.id || "").toLowerCase() !== id) return null;
   const comments = commentsResult.status === "fulfilled" && Array.isArray(commentsResult.value?.data)
@@ -3963,7 +3975,7 @@ function extractStackExchangeQuestionData(url, questionJson, answersJson, opts =
     `Site: ${siteName}`,
     `Score: ${Number(question.score) || 0}`,
     `Answers: ${Number(question.answer_count) || 0}`,
-    `Views: ${Number(question.view_count) || 0}`,
+    Number.isFinite(Number(question.view_count)) ? `Views: ${Number(question.view_count)}` : "",
     Array.isArray(question.tags) && question.tags.length ? `Tags: ${question.tags.join(", ")}` : "",
     published ? `Asked: ${published}` : "",
     question.owner?.display_name ? `Author: ${decodeEntities(question.owner.display_name)}` : "",
@@ -3995,6 +4007,91 @@ function extractStackExchangeQuestionData(url, questionJson, answersJson, opts =
       })),
       quota_remaining: questionJson.quota_remaining,
     }),
+  };
+}
+
+// One level of XML escaping, undone in a single pass. decodeEntities runs its
+// replacements one after another, so "&amp;lt;" would come out as "<" and the
+// code sample "#include &lt;algorithm&gt;" in a feed body would turn into a tag.
+const XML_NAMED_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+function unescapeXml(value) {
+  return String(value || "").replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g, (match, dec, hex, named) => {
+    if (named) return XML_NAMED_ENTITIES[named];
+    try {
+      return String.fromCodePoint(dec ? Number(dec) : parseInt(hex, 16));
+    } catch {
+      return match;
+    }
+  });
+}
+
+// Text inside the first <tag …>…</tag> of an XML chunk, found by index.
+function xmlElementText(chunk, tag) {
+  const open = chunk.indexOf(`<${tag}`);
+  if (open < 0) return "";
+  const start = chunk.indexOf(">", open);
+  const end = start < 0 ? -1 : chunk.indexOf(`</${tag}>`, start);
+  return end < 0 ? "" : chunk.slice(start + 1, end);
+}
+
+// Stack Overflow serves a question's Atom feed (the question, then each answer
+// with its score and full HTML body) to the Worker while the HTML page sits
+// behind a challenge and the keyless API quota of Cloudflare's shared egress
+// IPs is spent. Reshaped into the API's question/answers JSON so the same
+// extractor applies. The feed has no view count or accepted-answer mark, and
+// it holds only the 30 most recent entries.
+const STACK_EXCHANGE_FEED_ENTRY_LIMIT = 30;
+
+function stackExchangeFeedToApiShape(xml) {
+  const entries = String(xml || "").split("<entry>").slice(1).map((chunk) => chunk.split("</entry>")[0]);
+  if (!entries.length) return null;
+  const toItem = (entry) => {
+    const id = unescapeXml(xmlElementText(entry, "id")).trim();
+    const published = Date.parse(xmlElementText(entry, "published"));
+    return {
+      link: id,
+      score: Number(xmlElementText(entry, "re:rank")) || 0,
+      title: unescapeXml(xmlElementText(entry, "title")).trim(),
+      owner: { display_name: unescapeXml(xmlElementText(xmlElementText(entry, "author"), "name")).trim() },
+      creation_date: Number.isFinite(published) ? Math.floor(published / 1000) : undefined,
+      // The summary is escaped HTML; one unescape yields the HTML itself.
+      body: unescapeXml(xmlElementText(entry, "summary")).trim(),
+    };
+  };
+  const [questionEntry, ...answerEntries] = entries;
+  const question = toItem(questionEntry);
+  const questionId = Number(question.link.match(/\/q(?:uestions)?\/(\d+)/)?.[1]);
+  if (!questionId || !question.body) return null;
+  const tags = [...questionEntry.matchAll(/<category\b[^>]*\bterm="([^"]*)"/g)].map((m) => unescapeXml(m[1]));
+  const answers = answerEntries
+    .map((entry) => {
+      const item = toItem(entry);
+      return { ...item, answer_id: Number(item.link.match(/#(\d+)$/)?.[1]) || undefined };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+  return {
+    question: { items: [{ ...question, question_id: questionId, tags, answer_count: answerEntries.length }] },
+    answers: { items: answers },
+    truncated: entries.length >= STACK_EXCHANGE_FEED_ENTRY_LIMIT,
+  };
+}
+
+async function fetchStackExchangeFeed(target, questionId, signal) {
+  const feedUrl = `https://${target.site}/feeds/question/${questionId}`;
+  const response = await fetch(feedUrl, {
+    headers: fetchHeaders(USER_AGENTS[0], new Map(), { Accept: "application/atom+xml,application/xml;q=0.9,*/*;q=0.8" }),
+    signal,
+  });
+  if (!response.ok) throw new Error(`feed HTTP ${response.status}`);
+  const shaped = stackExchangeFeedToApiShape(await response.text());
+  if (!shaped) throw new Error("feed had no question entry");
+  return {
+    ...shaped,
+    feedUrl,
+    status: response.status,
+    contentType: response.headers.get("content-type") || "application/atom+xml",
   };
 }
 
@@ -4051,21 +4148,40 @@ async function trySiteApiFirst(url, opts, signal, warnings, debugInfo) {
       const questionUrl = `https://api.stackexchange.com/2.3/questions/${questionId}?site=${encodeURIComponent(seTarget.site)}&filter=withbody`;
       const answersUrl = `https://api.stackexchange.com/2.3/questions/${questionId}/answers?site=${encodeURIComponent(seTarget.site)}&filter=withbody&sort=votes&order=desc&pagesize=10`;
       apiUrl = questionUrl;
-      const [questionResponse, answersResponse] = await Promise.all([fetchJsonApi(questionUrl, signal), fetchJsonApi(answersUrl, signal)]);
-      if (!questionResponse || !answersResponse) throw new Error("Stack Exchange question or answers were not found");
-      if (linkedAnswer) {
-        const linkedId = Number(linkedAnswer.answer_id);
-        const answers = answersResponse.json.items || [];
-        const index = answers.findIndex((answer) => Number(answer.answer_id) === linkedId);
-        const selected = index >= 0 ? answers.splice(index, 1)[0] : linkedAnswer;
-        answers.unshift({ ...selected, _linked: true });
+      let questionResponse;
+      let answersResponse;
+      try {
+        [questionResponse, answersResponse] = await Promise.all([fetchJsonApi(questionUrl, signal), fetchJsonApi(answersUrl, signal)]);
+      } catch (apiErr) {
+        // Keyless quota is per IP, and Cloudflare's egress IPs are shared, so
+        // throttle_violation is the usual answer here. The feed needs no key.
+        const feed = await fetchStackExchangeFeed(seTarget, questionId, signal);
+        warnings.push(`Stack Exchange API 실패(${String(apiErr?.message || apiErr).slice(0, 80)}) → 질문 피드로 대체`);
+        if (feed.truncated) warnings.push("Stack Exchange 피드는 최근 30개 항목만 담으므로 오래된 답변이 빠졌을 수 있습니다.");
+        page = extractStackExchangeQuestionData(url, feed.question, feed.answers, opts);
+        rawJson = { question: feed.question, answers: feed.answers };
+        responseInfo = { status: feed.status, finalUrl: feed.feedUrl, contentType: feed.contentType, contentLength: "" };
+        apiUrl = feed.feedUrl;
+        source = "stackexchange-feed";
+        urlKind = "stackexchange-feed";
+        warning = "Stack Exchange HTML은 Worker를 차단하므로 질문 피드(Atom)로 가져옴";
       }
-      rawJson = { question: questionResponse.json, answers: answersResponse.json };
-      responseInfo = questionResponse;
-      page = extractStackExchangeQuestionData(url, questionResponse.json, answersResponse.json, opts);
-      source = "stackexchange-api";
-      urlKind = "stackexchange-api";
-      warning = "Stack Exchange HTML은 Worker를 차단하므로 공식 API로 가져옴";
+      if (source !== "stackexchange-feed") {
+        if (!questionResponse || !answersResponse) throw new Error("Stack Exchange question or answers were not found");
+        if (linkedAnswer) {
+          const linkedId = Number(linkedAnswer.answer_id);
+          const answers = answersResponse.json.items || [];
+          const index = answers.findIndex((answer) => Number(answer.answer_id) === linkedId);
+          const selected = index >= 0 ? answers.splice(index, 1)[0] : linkedAnswer;
+          answers.unshift({ ...selected, _linked: true });
+        }
+        rawJson = { question: questionResponse.json, answers: answersResponse.json };
+        responseInfo = questionResponse;
+        page = extractStackExchangeQuestionData(url, questionResponse.json, answersResponse.json, opts);
+        source = "stackexchange-api";
+        urlKind = "stackexchange-api";
+        warning = "Stack Exchange HTML은 Worker를 차단하므로 공식 API로 가져옴";
+      }
     }
     if (!page) return null;
     warnings.push(warning);
@@ -5571,7 +5687,7 @@ const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
   "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
-  "Hacker News items and Stack Exchange questions are read through their official APIs (source: hn-algolia / stackexchange-api); blocked Reddit posts come from the Arctic Shift archive (source: reddit-archive, scores and comments as of capture); YouTube watch pages include the video description.",
+  "Hacker News items and Stack Exchange questions are read through their official APIs (source: hn-algolia / stackexchange-api, or stackexchange-feed when the keyless API quota is spent); blocked Reddit posts come from the Arctic Shift archive (source: reddit-archive, scores and comments as of capture); YouTube watch pages include the video description.",
   "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
   "If the body exceeds max_chars, call again with the same URL and page+1.",
 ].join(" ");
@@ -6026,6 +6142,7 @@ export {
   stackExchangeQuestionTarget,
   extractStackExchangeQuestionData,
   trySiteApiFirst,
+  stackExchangeFeedToApiShape,
   redditPostIdFromUrl,
   buildRedditArchiveListing,
   fetchRedditArchive,

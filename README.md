@@ -47,7 +47,7 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 | DCinside | 모바일 URL 변환, `dcinside.app` UA, 로그인·광고 리다이렉트 싱크 차단, 댓글 XHR 재현, 본문 이미지 자동 첨부 |
 | Reddit | HTML이 봇 검증에 걸리면 공개 `.json?raw_json=1`로 폴백, 본문+댓글 트리 추출. Reddit은 Worker·Perplexity·Wayback을 모두 막으므로, 글 URL이면 유료 호출 전에 Arctic Shift 공개 아카이브(무료, 점수·댓글은 수집 시점 기준)에서 같은 모양의 JSON을 받아 같은 추출기로 처리 |
 | Hacker News | HTML이 Worker에 419를 돌려주므로 항목(`/item?id=`)과 첫 페이지는 처음부터 Algolia 공식 API로 가져옴. 댓글 트리를 들여쓰기로 보존 |
-| Stack Exchange | Stack Overflow 등 Stack Exchange 계열 질문(`/questions/<id>`, `/q/`, `/a/`)은 Cloudflare 챌린지 대신 공식 API로 질문과 투표순 답변 10개를 가져옴 |
+| Stack Exchange | Stack Overflow 등 Stack Exchange 계열 질문(`/questions/<id>`, `/q/`, `/a/`)은 Cloudflare 챌린지 대신 공식 API로 질문과 투표순 답변 10개를 가져옴. 키 없는 API 몫은 IP 단위라 Cloudflare 공유 출구에서 자주 소진되므로(`throttle_violation`), 그때는 질문 Atom 피드(질문과 최근 30개 항목의 답변 본문·점수)로 대체 |
 | YouTube | 시청 페이지의 `ytInitialPlayerResponse`에서 제목·채널·게시일·길이·조회수·설명을 추출. Worker가 429를 받으면 Wayback 캡처에서 같은 데이터를 읽음 |
 | 나무위키 | VPN/IDC 공지, `[편집]` 마커, 분류·네비게이션 상자, 목차 제거. `/raw/`는 동일 `rev`의 `/w/` 읽기 URL로 바꾸고 공식 `Perplexity-User` UA로 Worker에서 직접 확인. 직접 경로가 막히면 Wayback Machine 최신 캡처(무료)를 먼저 시도하고, 이어서 Agent·검색 폴백 사용 |
 | MediaWiki | `mw-content-text` 추출, 목차·편집 링크·알림 상자·썸네일 캡션 제거 |

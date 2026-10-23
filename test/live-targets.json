@@ -58,7 +58,7 @@
       "name": "stack overflow question via api",
       "url": "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-processing-an-unsorted-array",
       "min_body_chars": 2000,
-      "expect_source": ["stackexchange-api"],
+      "expect_source": ["stackexchange-api", "stackexchange-feed"],
       "must_contain": ["sorted array"]
     },
     {

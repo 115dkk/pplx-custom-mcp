@@ -185,3 +185,93 @@ test("tryRedditArchive observes deadline and returns archive metadata", async ()
     stub.restore();
   }
 });
+
+test("Stack Exchange feed is reshaped into the API's question and answers", async () => {
+  const { stackExchangeFeedToApiShape } = await import("../src/index.js");
+  const shaped = stackExchangeFeedToApiShape(fixture("stackexchange-feed.xml"));
+  const question = shaped.question.items[0];
+  assert.equal(question.question_id, 11227809);
+  assert.equal(question.score, 27546);
+  assert.ok(question.tags.includes("c++"), "tag entities are decoded");
+  assert.match(question.body, /^<p>In this C\+\+ code/);
+  assert.ok(question.body.includes("#include &lt;algorithm&gt;"), "code samples keep exactly one level of escaping");
+  assert.deepEqual(shaped.answers.items.map((answer) => answer.score), [35296, 39], "answers are ordered by score");
+  assert.equal(shaped.truncated, false);
+  assert.equal(stackExchangeFeedToApiShape("<feed></feed>"), null);
+});
+
+test("trySiteApiFirst falls back to the question feed when the API is throttled", async () => {
+  const throttled = JSON.stringify({ error_id: 502, error_name: "throttle_violation", error_message: "too many requests from this IP" });
+  const stub = installFetch([
+    jsonRoute("https://api.stackexchange.com/2.3/questions/11227809", throttled, 400),
+    { url: "https://stackoverflow.com/feeds/question/11227809", body: fixture("stackexchange-feed.xml"), headers: { "content-type": "application/atom+xml" } },
+  ]);
+  const warnings = [];
+  try {
+    const page = await trySiteApiFirst(
+      "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster",
+      { site_preset: "auto", include_links: true },
+      undefined,
+      warnings,
+      { attempts: [] }
+    );
+    assert.equal(page.source, "stackexchange-feed");
+    assert.match(page.text, /^# Why is conditional processing of a sorted array faster/);
+    assert.match(page.text, /\[A1\] score 35296/);
+    assert.match(page.text, /Branch prediction/);
+    assert.ok(page.text.includes("#include <algorithm>"), "code samples survive as text, not as stripped tags");
+    assert.doesNotMatch(page.text, /Views:/, "the feed has no view count, so none is invented");
+    assert.ok(warnings.some((warning) => warning.includes("throttle_violation")));
+  } finally {
+    stub.restore();
+  }
+});
+
+test("Reddit archive retries with a second identity and reports a refused request", async () => {
+  const postsUrl = "https://arctic-shift.photon-reddit.com/api/posts/ids?ids=1fp5gut";
+  const commentsUrl = "https://arctic-shift.photon-reddit.com/api/comments/tree?link_id=1fp5gut&limit=200";
+  let firstIdentityRefused = 0;
+  let stub = installFetch([
+    {
+      url: postsUrl,
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: (url, init) => {
+        if (String(init.headers?.["User-Agent"] || "").startsWith("perplexity-mcp/")) {
+          firstIdentityRefused++;
+          return "__refuse__";
+        }
+        return fixture("reddit-archive-post.json");
+      },
+    },
+    jsonRoute(commentsUrl, fixture("reddit-archive-comments.json")),
+  ]);
+  // installFetch cannot vary the status per call, so wrap it.
+  const routed = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const res = await routed(input, init);
+    const text = await res.clone().text();
+    return text === "__refuse__" ? new Response("blocked", { status: 403 }) : res;
+  };
+  try {
+    const page = await fetchRedditArchive(REDDIT_URL, {});
+    assert.match(page.text, /Archive fixture post/);
+    assert.equal(firstIdentityRefused, 1);
+  } finally {
+    globalThis.fetch = routed;
+    stub.restore();
+  }
+
+  stub = installFetch([
+    jsonRoute(postsUrl, "blocked", 403),
+    jsonRoute(commentsUrl, "blocked", 403),
+  ]);
+  const warnings = [];
+  try {
+    const result = await tryRedditArchive(REDDIT_URL, { site_preset: "reddit" }, warnings, 3);
+    assert.equal(result, null);
+    assert.ok(warnings.some((warning) => warning.includes("HTTP 403")), warnings.join(" | "));
+  } finally {
+    stub.restore();
+  }
+});
