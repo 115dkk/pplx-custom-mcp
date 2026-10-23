@@ -39,7 +39,7 @@ test("YouTube player response yields video body and structured fields", () => {
   assert.match(page.text, /Length: 3:32/);
   assert.match(page.text, /Views: 12345/);
   assert.match(page.text, /Keywords: one, two, three/);
-  assert.match(page.text, /https:\/\/example\.com\/video/, "description URLs are prose and must survive include_links=false");
+  assert.ok(page.text.includes("https://example.com/video"), "description URLs are prose and must survive include_links=false");
   assert.equal(page.structured.video_id, "abc123");
   assert.equal(page.structured.length_seconds, 212);
   assert.equal(page.structured.view_count, 12345);
@@ -67,7 +67,7 @@ test("cleaning: anchor attributes containing '>' stay out of the link label", ()
   // Brunch: data-tiara-action-name="본문 하단 > 키워드 클릭" on keyword links.
   const html = `<p>keyword <a href="/keyword/x" data-tiara-action-name="본문 하단 > 키워드 클릭" data-tiara-layer="bottom">브런치</a></p>`;
   const out = htmlToText(html, "balanced", { include_links: true, base_url: "https://brunch.co.kr/" });
-  assert.match(out, /\[브런치\]\(<https:\/\/brunch\.co\.kr\/keyword\/x>\)/);
+  assert.ok(out.includes("[브런치](<https://brunch.co.kr/keyword/x>)"), out);
   assert.doesNotMatch(out, /data-tiara|키워드 클릭/);
 });
 
