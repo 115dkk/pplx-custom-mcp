@@ -36,7 +36,7 @@
       "name": "namuwiki via blocked-site fallback",
       "url": "https://namu.wiki/w/나무위키",
       "min_body_chars": 3000,
-      "expect_source": ["direct", "agent-fetch-url", "perplexity"],
+      "expect_source": ["direct", "wayback", "agent-fetch-url", "perplexity"],
       "must_contain": []
     },
     {
@@ -46,6 +46,42 @@
       "min_body_chars": 500,
       "expect_source": ["direct", "sourceforge-allura", "agent-fetch-url"],
       "must_contain": ["MinGW"]
+    },
+    {
+      "name": "hacker news item via algolia",
+      "url": "https://news.ycombinator.com/item?id=8863",
+      "min_body_chars": 1500,
+      "expect_source": ["hn-algolia"],
+      "must_contain": ["My YC app: Dropbox"]
+    },
+    {
+      "name": "stack overflow question via api",
+      "url": "https://stackoverflow.com/questions/11227809/why-is-processing-a-sorted-array-faster-than-processing-an-unsorted-array",
+      "min_body_chars": 2000,
+      "expect_source": ["stackexchange-api"],
+      "must_contain": ["sorted array"]
+    },
+    {
+      "name": "reddit post via json or archive",
+      "url": "https://www.reddit.com/r/LocalLLaMA/comments/1fp5gut/",
+      "min_body_chars": 800,
+      "expect_source": ["reddit-json", "reddit-archive"],
+      "must_contain": ["Molmo"]
+    },
+    {
+      "//": "YouTube rate-limits Worker egress intermittently (HTTP 429); a fresh Wayback capture carries the same player JSON, so both paths count.",
+      "name": "youtube watch page details",
+      "url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+      "min_body_chars": 150,
+      "expect_source": ["direct", "wayback"],
+      "must_contain": ["Channel: jawed"]
+    },
+    {
+      "name": "tistory post is not redirected to search",
+      "url": "https://cocoon1787.tistory.com/689",
+      "min_body_chars": 1500,
+      "expect_source": ["direct"],
+      "must_contain": ["README"]
     }
   ],
   "//optional": "Entries with a blank url are skipped, not failed. Paste a current DCinside post here when you want to verify comment loading against the live site.",
@@ -57,5 +93,6 @@
       "expect_source": ["direct"],
       "must_contain": ["## 댓글"]
     }
-  ]
+  ],
+  "//wayback": "Verified 2026-10-23: namu.wiki refuses Worker egress and Perplexity fetch_url alike, so the Wayback snapshot is its healthy path. Hacker News (HTTP 419), Stack Overflow (Cloudflare challenge) and Reddit (403) refuse Worker egress too; they are served by their official APIs or the Arctic Shift archive."
 }

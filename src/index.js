@@ -3,11 +3,16 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
+const CHROME_MAJOR = 157;
+const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
+const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
 const FETCH_TOTAL_BUDGET_MS = 25_000;
+const FETCH_DEADLINE_MS = 40_000;
+const TOOL_DEADLINE_MS = 50_000;
 const FETCH_MAX_CHARS_DEFAULT = 8_000;
 const FETCH_MAX_CHARS_LIMIT = 32_000;
 const FETCH_URL_MAX_LENGTH = 4_096;
@@ -32,9 +37,9 @@ const USER_AGENTS = [
   // Googlebot first: many SPA sites pre-render for SEO.
   "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
   // Desktop Chrome.
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  DESKTOP_CHROME_UA,
   // iOS Safari (mobile-light variants of paywalled/heavy sites).
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  IOS_SAFARI_UA,
 ];
 
 // Perplexity documents this as its user-requested fetch identity. Unlike the
@@ -48,13 +53,13 @@ const NAMU_USER_AGENTS = [
 const DCINSIDE_USER_AGENTS = [
   "dcinside.app",
   "dcinside.app",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  DESKTOP_CHROME_UA,
+  IOS_SAFARI_UA,
 ];
 
 const REDDIT_USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  DESKTOP_CHROME_UA,
+  IOS_SAFARI_UA,
   `perplexity-mcp/${VERSION} public Reddit JSON fallback`,
 ];
 
@@ -426,9 +431,7 @@ const HTML_ENTITIES = [
 ];
 
 /** @type {Array<[RegExp, string]>} */
-const BASE_STRUCTURAL_PATTERNS = [
-  [/<!--[\s\S]*?-->/g, ""],
-];
+const BASE_STRUCTURAL_PATTERNS = [];
 
 /** @type {Array<[RegExp, string]>} */
 const BALANCED_STRUCTURAL_PATTERNS = [
@@ -454,6 +457,7 @@ const STRICT_STRUCTURAL_PATTERNS = [
 ];
 
 // Sentence-bounded so a single literal "cookie" mention in body doesn't nuke a paragraph.
+/** @type {Array<[RegExp, string]>} */
 const JUNK_PATTERNS = [
   [/(we use cookies|cookie policy|accept (all )?cookies|쿠키 (사용|정책|동의))[^.\n]{0,200}\.?/gi, ""],
   [/(subscribe to (our )?newsletter|sign up for[^.\n]{0,80}newsletter|뉴스레터 (구독|신청))[^.\n]{0,200}\.?/gi, ""],
@@ -554,7 +558,7 @@ function structuralPatternsForMode(mode) {
 
 function cleanText(s, mode = "balanced") {
   if (!s) return "";
-  let out = s;
+  let out = String(s).replace(/\r\n?/g, "\n");
   const normalized = normalizeCleaningMode(mode);
   if (normalized !== "raw-ish") {
     for (const [re, rep] of JUNK_PATTERNS) out = out.replace(re, rep);
@@ -601,14 +605,57 @@ function markdownLink(label, url) {
   return safeUrl ? `[${safeLabel}](<${safeUrl}>)` : safeLabel;
 }
 
+// Index of the '>' that closes the tag opening at `start`, skipping any '>'
+// inside a quoted attribute value, or -1. One forward pass.
+function findTagOpenEnd(source, start) {
+  let quote = "";
+  for (let i = start + 1; i < source.length; i++) {
+    const char = source[i];
+    if (quote) {
+      if (char === quote) quote = "";
+    } else if (char === "\"" || char === "'") {
+      quote = char;
+    } else if (char === ">") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function anchorToMarkdown(rawAttrs, inner, includeLinks, baseUrl) {
+  const label = fragmentToText(inner);
+  if (!includeLinks) return ` ${label || inner} `;
+  const href = normalizeLinkHref(parseAttributes(rawAttrs).href, baseUrl);
+  if (!href) return ` ${label || inner} `;
+  return ` ${markdownLink(label || href, href)} `;
+}
+
+// Anchors are found by scanning forward rather than with a regular expression.
+// Attribute values may contain '>' (Brunch writes data-tiara-action-name="본문
+// 하단 > 키워드 클릭"), which cuts a [^>]* pattern short and leaks the rest of
+// the attribute into the link label, while a quote-aware pattern backtracks
+// quadratically on malformed markup.
 function htmlLinksToMarkdown(html, { include_links = false, base_url = "" } = {}) {
-  return String(html || "").replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (all, rawAttrs, inner) => {
-    const label = fragmentToText(inner);
-    if (!include_links) return ` ${label || inner} `;
-    const href = normalizeLinkHref(parseAttributes(rawAttrs).href, base_url);
-    if (!href) return ` ${label || inner} `;
-    return ` ${markdownLink(label || href, href)} `;
-  });
+  const source = String(html || "");
+  const lower = source.toLowerCase();
+  const output = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = findHtmlTagStart(lower, "a", cursor);
+    if (start < 0) break;
+    const openEnd = findTagOpenEnd(source, start);
+    if (openEnd < 0) break;
+    const closeEnd = findHtmlTagEnd(lower, "a", openEnd + 1);
+    if (closeEnd < 0) break;
+    const closeStart = lower.lastIndexOf("</a", closeEnd);
+    output.push(
+      source.slice(cursor, start),
+      anchorToMarkdown(source.slice(start + 2, openEnd), source.slice(openEnd + 1, closeStart), include_links, base_url)
+    );
+    cursor = closeEnd;
+  }
+  output.push(source.slice(cursor));
+  return output.join("");
 }
 
 function stripMarkdownLinks(text) {
@@ -649,17 +696,71 @@ function extractLinksFromMarkdown(text, baseUrl = "", limit = 80) {
   return links;
 }
 
+function stripHtmlTagsQuoteAware(input) {
+  const source = String(input || "");
+  const output = [];
+  let textStart = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    if (source[i] !== "<") {
+      i++;
+      continue;
+    }
+
+    const after = source.slice(i + 1, i + 9).toLowerCase();
+    if (after.startsWith("!--")) {
+      output.push(source.slice(textStart, i), " ");
+      const end = source.indexOf("-->", i + 4);
+      if (end < 0) return output.join("");
+      i = end + 3;
+      textStart = i;
+      continue;
+    }
+    if (["https:", "http:", "mailto:", "tel:", "ftp:"].some((scheme) => after.startsWith(scheme))) {
+      i++;
+      continue;
+    }
+    if (!/[a-zA-Z!/?]/.test(source[i + 1] || "")) {
+      i++;
+      continue;
+    }
+
+    output.push(source.slice(textStart, i));
+    const tagStart = i;
+    i++;
+    let quote = "";
+    while (i < source.length) {
+      const char = source[i];
+      if (quote) {
+        if (char === quote) quote = "";
+      } else if (char === "\"" || char === "'") {
+        quote = char;
+      } else if (char === ">") {
+        output.push(" ");
+        i++;
+        textStart = i;
+        break;
+      }
+      i++;
+    }
+    if (i >= source.length && textStart <= tagStart) {
+      const remainder = source.slice(tagStart);
+      output.push(remainder.includes(">") ? remainder.replace(/<[^>]+>/g, " ") : remainder);
+      textStart = source.length;
+    }
+  }
+  output.push(source.slice(textStart));
+  return output.join("");
+}
+
 function htmlToText(html, mode = "balanced", opts = {}) {
-  let out = stripRawTextElements(html);
+  let out = stripRawTextElements(String(html || "").replace(/\r\n?/g, "\n"));
   for (const [re, rep] of structuralPatternsForMode(mode)) out = out.replace(re, rep);
   out = htmlLinksToMarkdown(out, opts);
   out = out.replace(/<br\s*\/?>/gi, "\n");
   out = out.replace(/<\/(p|div|li|h[1-6]|tr|article|section)>/gi, "\n");
-  // htmlLinksToMarkdown emits `[label](<url>)`; the angle brackets keep URLs
-  // containing spaces or parens valid in Markdown, but they also look like tags.
-  // Skip anything whose first token is a URL scheme so tag stripping does not
-  // swallow the href and leave `[label]( )` behind.
-  out = out.replace(/<(?!(?:https?|mailto|tel|ftp):)[^>]+>/g, " ");
+  out = stripHtmlTagsQuoteAware(out);
   out = decodeEntities(out);
   return cleanText(out, mode);
 }
@@ -854,8 +955,23 @@ const SEC_FETCH_BY_KIND = {
   },
 };
 
+function chromeSecChUa(major) {
+  const chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+  const versions = ["8", "99", "24"];
+  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  const grease = [`Not${chars[major % 11]}A${chars[(major + 1) % 11]}Brand`, versions[major % 3]];
+  const chromium = ["Chromium", String(major)];
+  const chrome = ["Google Chrome", String(major)];
+  const order = orders[major % 6];
+  const list = Array(3);
+  list[order[0]] = grease;
+  list[order[1]] = chromium;
+  list[order[2]] = chrome;
+  return list.map(([brand, version]) => `"${brand}";v="${version}"`).join(", ");
+}
+
 const CHROME_CLIENT_HINTS = {
-  "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
+  "sec-ch-ua": chromeSecChUa(CHROME_MAJOR),
   "sec-ch-ua-mobile": "?0",
   "sec-ch-ua-platform": '"Windows"',
 };
@@ -1283,7 +1399,7 @@ async function fetchOnce(url, ua, signal, cookieJar, sitePreset = "auto") {
 }
 
 function looksBlocked(status, body, pageUrl = "") {
-  if (status === 403 || status === 503 || status === 429) return true;
+  if ([403, 419, 429, 430, 503].includes(status)) return true;
   if (isDcinsideAuthOrSinkUrl(pageUrl)) return true;
   // Common challenge/verification page markers (HTTP 200 with bot-block content).
   //
@@ -1614,6 +1730,35 @@ function safeResolveUrl(baseUrl, candidate) {
   return "";
 }
 
+// Interstitial redirect pages say "redirecting…" and little else; a page with
+// an article on it is not one, whatever its scripts do.
+const CLIENT_REDIRECT_PAGE_TEXT_LIMIT = 600;
+
+function roughVisibleTextLength(html) {
+  return stripHtmlTagsQuoteAware(stripRawTextElements(html)).replace(/\s+/g, " ").trim().length;
+}
+
+// Bodies of inline <script> elements, found with the same index-based tag
+// scanner as stripHtmlElementBlocks rather than a regular expression.
+function inlineScriptBodies(html) {
+  const source = String(html || "");
+  const lower = source.toLowerCase();
+  const bodies = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = findHtmlTagStart(lower, "script", cursor);
+    if (start < 0) break;
+    const openEnd = lower.indexOf(">", start + "<script".length);
+    if (openEnd < 0) break;
+    const closeEnd = findHtmlTagEnd(lower, "script", openEnd + 1);
+    if (closeEnd < 0) break;
+    const closeStart = lower.lastIndexOf("</script", closeEnd);
+    bodies.push(source.slice(openEnd + 1, closeStart));
+    cursor = closeEnd;
+  }
+  return bodies;
+}
+
 function extractClientRedirect(baseUrl, html) {
   for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
     const tag = match[0];
@@ -1626,17 +1771,28 @@ function extractClientRedirect(baseUrl, html) {
     }
   }
 
+  // A script assignment is only a redirect when it is the page's whole job.
+  // Tistory blogs put `window.location.href = '/search' + '/' + query` in the
+  // search box's onkeypress handler, and following that replaced every post
+  // with the blog's empty search page. So: inline <script> bodies only, the
+  // literal must be the entire right-hand side, and the page itself must be
+  // close to empty, as interstitials are.
   const jsPatterns = [
-    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i,
+    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["'][ \t]*(?=;|}|$|(?:\r\n?|\n)(?!\s*[+\-*\/%.,?:|&(\[]))/i,
     /(?:window\.)?location\.replace\(\s*["']([^"']+)["']\s*\)/i,
-    /document\.location\s*=\s*["']([^"']+)["']/i,
+    /document\.location\s*=\s*["']([^"']+)["'][ \t]*(?=;|}|$|(?:\r\n?|\n)(?!\s*[+\-*\/%.,?:|&(\[]))/i,
   ];
   const scan = html.slice(0, 40_000);
+  const scripts = inlineScriptBodies(scan).join("\n");
+  if (!scripts) return null;
   for (const re of jsPatterns) {
-    const match = scan.match(re);
+    const match = scripts.match(re);
     if (!match) continue;
-    const target = safeResolveUrl(baseUrl, match[1]);
-    if (target) return { url: target, kind: "javascript-redirect" };
+    // Naver escapes slashes inside the literal: 'https:\/\/m.blog.naver.com\/…'.
+    const target = safeResolveUrl(baseUrl, match[1].replace(/\\\//g, "/"));
+    if (!target) continue;
+    if (roughVisibleTextLength(html) > CLIENT_REDIRECT_PAGE_TEXT_LIMIT) return null;
+    return { url: target, kind: "javascript-redirect" };
   }
   return null;
 }
@@ -1908,8 +2064,7 @@ function extractDcinsideArticleData(url, html, mode = "balanced", opts = {}) {
 // DCinside renders the article body server-side but loads the comment
 // thread via a separate XHR POST to /board/comment/. A plain fetch never
 // runs that JS, so comments are missing. We replicate the XHR directly.
-const DCINSIDE_DESKTOP_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const DCINSIDE_DESKTOP_UA = DESKTOP_CHROME_UA;
 const DCINSIDE_COMMENT_ENDPOINT = "https://gall.dcinside.com/board/comment/";
 const DCINSIDE_COMMENT_MAX_PAGES = 8;
 const DCINSIDE_COMMENT_MAX_ITEMS = 400;
@@ -2328,6 +2483,203 @@ function extractRedditPostData(url, body, opts = {}) {
       link_url: linkUrl || undefined,
       is_self: !!post.is_self,
       comments: comments.length ? comments : undefined,
+    }),
+  };
+}
+
+function redditPostIdFromUrl(url) {
+  if (!isRedditUrl(url)) return "";
+  try {
+    return (new URL(url).pathname.match(/^\/(?:(?:r|u|user)\/[^/]+\/)?comments\/([a-z0-9]+)(?:\/|$)/i)?.[1] || "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function buildRedditArchiveListing(post, commentsTree) {
+  return [
+    { kind: "Listing", data: { children: [{ kind: "t3", data: post }] } },
+    { kind: "Listing", data: { children: Array.isArray(commentsTree) ? commentsTree : [] } },
+  ];
+}
+
+function archiveTimestampIso(value) {
+  if (value === "" || value === null || value === undefined) return "";
+  const number = Number(value);
+  if (Number.isFinite(number)) return new Date(number > 1e12 ? number : number * 1000).toISOString();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+async function fetchRedditArchive(url, opts = {}, signal) {
+  const id = redditPostIdFromUrl(url);
+  if (!id) return null;
+  const postsUrl = `https://arctic-shift.photon-reddit.com/api/posts/ids?ids=${encodeURIComponent(id)}`;
+  const commentsUrl = `https://arctic-shift.photon-reddit.com/api/comments/tree?link_id=${encodeURIComponent(id)}&limit=200`;
+  const headers = { Accept: "application/json", "User-Agent": DESKTOP_CHROME_UA };
+  const read = async (target) => {
+    const response = await fetch(target, { headers, signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  };
+  const [postsResult, commentsResult] = await Promise.allSettled([read(postsUrl), read(commentsUrl)]);
+  if (postsResult.status !== "fulfilled") return null;
+  const post = postsResult.value?.data?.[0];
+  if (!post || String(post.id || "").toLowerCase() !== id) return null;
+  const comments = commentsResult.status === "fulfilled" && Array.isArray(commentsResult.value?.data)
+    ? commentsResult.value.data
+    : [];
+  const listing = buildRedditArchiveListing(post, comments);
+  const page = extractRedditPostData(url, JSON.stringify(listing), opts);
+  if (!page) return null;
+  const archivedAt = archiveTimestampIso(post._meta?.retrieved_2nd_on ?? post.retrieved_on);
+  return { ...page, archivedAt, apiUrl: postsUrl };
+}
+
+async function tryRedditArchive(url, opts, warnings, attemptTotal, deadline) {
+  if (opts.site_preset !== "reddit") return null;
+  const remaining = deadline ? Number(deadline.remaining()) : 10_000;
+  if (!Number.isFinite(remaining) || remaining < 3_000) return null;
+  const timeout = Math.min(10_000, remaining);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const onAbort = () => controller.abort();
+  opts.signal?.addEventListener?.("abort", onAbort, { once: true });
+  try {
+    const page = await fetchRedditArchive(url, opts, controller.signal);
+    if (!page) {
+      warnings.push("Arctic Shift: 이 글의 아카이브 없음");
+      return null;
+    }
+    warnings.push(`Reddit 직접 fetch가 차단되어 Arctic Shift 아카이브로 대체: ${page.apiUrl} — 점수와 댓글은 수집 시점 기준입니다.`);
+    return {
+      ok: true,
+      partial: true,
+      source: "reddit-archive",
+      text: `[Reddit이 Worker 접근을 차단해 Arctic Shift 아카이브로 대체 (점수·댓글은 수집 시점 기준, 무료)]\n\n${page.text}`,
+      attempt: attemptTotal + 1,
+      warnings,
+      meta: page.meta,
+      structured: { ...page.structured, archived_source: "arctic-shift", archived_at: page.archivedAt || undefined },
+      finalUrl: url,
+      status: 200,
+    };
+  } catch (err) {
+    warnings.push(`Arctic Shift 아카이브 fetch 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 160)}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener?.("abort", onAbort);
+  }
+}
+
+function extractBalancedJson(text, startIndex) {
+  const source = String(text || "");
+  if (source[startIndex] !== "{") return null;
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = startIndex; index < source.length; index++) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(source.slice(startIndex, index + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function youtubeVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "youtu.be") return parsed.pathname.split("/").filter(Boolean)[0] || "";
+    if (!(host === "youtube.com" || host === "m.youtube.com")) return "";
+    if (parsed.pathname === "/watch") return parsed.searchParams.get("v") || "";
+    return parsed.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || "";
+  } catch {
+    return "";
+  }
+}
+
+function formatVideoDuration(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = Math.floor(total % 60);
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function extractYouTubeVideoData(url, html, mode = "balanced", opts = {}) {
+  const urlVideoId = youtubeVideoId(url);
+  if (!urlVideoId) return null;
+  const match = /ytInitialPlayerResponse\s*=\s*\{/.exec(String(html || ""));
+  if (!match) return null;
+  const startIndex = match.index + match[0].lastIndexOf("{");
+  const player = extractBalancedJson(html, startIndex);
+  const details = player?.videoDetails;
+  if (!details) return null;
+  const microformat = player?.microformat?.playerMicroformatRenderer || {};
+  const videoId = details.videoId || urlVideoId;
+  const title = cleanText(details.title || "", mode);
+  const description = cleanText(details.shortDescription || "", mode);
+  const published = microformat.publishDate || microformat.uploadDate || "";
+  const keywords = Array.isArray(details.keywords) ? details.keywords : [];
+  const lengthSeconds = Number(details.lengthSeconds);
+  const facts = [
+    details.author ? `Channel: ${details.author}` : "",
+    published ? `Published: ${published}` : "",
+    Number.isFinite(lengthSeconds) ? `Length: ${formatVideoDuration(lengthSeconds)}` : "",
+    details.viewCount != null ? `Views: ${details.viewCount}` : "",
+    microformat.category ? `Category: ${microformat.category}` : "",
+  ].filter(Boolean).join(" | ");
+  const text = [
+    title ? `# ${title}` : "",
+    facts,
+    keywords.length ? `Keywords: ${keywords.slice(0, 15).join(", ")}` : "",
+    description,
+  ].filter(Boolean).join("\n\n");
+  return {
+    text,
+    meta: compactObject({
+      title,
+      description: description.slice(0, 500),
+      canonical: `https://www.youtube.com/watch?v=${videoId}`,
+      author: details.author,
+      published,
+      siteName: "YouTube",
+      type: "video",
+    }),
+    structured: compactObject({
+      type: "youtube_video",
+      video_id: videoId,
+      title,
+      channel: details.author,
+      channel_id: details.channelId,
+      published,
+      length_seconds: Number.isFinite(lengthSeconds) ? lengthSeconds : undefined,
+      view_count: Number.isFinite(Number(details.viewCount)) ? Number(details.viewCount) : undefined,
+      category: microformat.category,
+      keywords: keywords.length ? keywords : undefined,
     }),
   };
 }
@@ -3184,6 +3536,10 @@ const SITE_EXTRACTORS = {
     source: "reddit-json",
     extract: (url, body, mode, opts) => extractRedditPostData(url, body, opts),
   },
+  youtube: {
+    source: "direct",
+    extract: (url, body, mode, opts) => extractYouTubeVideoData(url, body, mode, opts),
+  },
   namu: {
     source: "direct",
     extract: (url, body, mode, opts) => extractNamuWikiData(url, body, mode, opts),
@@ -3333,11 +3689,51 @@ function lastResponseFields(last) {
   };
 }
 
-// Why the direct fetch did not produce a body. Same three-way choice was
-// spelled out at each of the three degradation points.
+// Absolute end time for one fetch; every stage asks how much is left.
+function createDeadline(ms) {
+  const end = Date.now() + ms;
+  return { end, remaining: () => Math.max(0, end - Date.now()) };
+}
+
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+  const startNext = () => {
+    while (active < max && queue.length) {
+      const { fn, resolve, reject } = queue.shift();
+      active++;
+      Promise.resolve()
+        .then(fn)
+        .then(resolve, reject)
+        .finally(() => {
+          active--;
+          startNext();
+        });
+    }
+  };
+  return {
+    run(fn) {
+      return new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        startNext();
+      });
+    },
+  };
+}
+
+function recordDeadlineStage(deadline, stage, startedAt, ok, note) {
+  if (!Array.isArray(deadline?.stages)) return;
+  const entry = { stage, ms: Date.now() - startedAt, ok };
+  if (note) entry.note = note;
+  deadline.stages.push(entry);
+}
+
+// Why the direct fetch did not produce a body. Same choice is reused at each
+// degradation point so the explanation reflects the strongest observed cause.
 function degradationCause(flags) {
   if (flags.steamAgeGate) return "steamAgeGate";
   if (flags.blocked) return "blocked";
+  if (flags.timedOut) return "timeout";
   return "shell";
 }
 
@@ -3345,21 +3741,25 @@ const DEGRADATION_TEXT = {
   agentFetch: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
+    timeout: "[직접 fetch 시간 초과 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity fetch_url로 원문 수신 (비용 ~$0.003-0.008)]",
   },
   perplexity: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
+    timeout: "[직접 fetch 시간 초과 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Perplexity site: 폴백 사용 (비용 ~$0.005)]",
   },
   wayback: {
     steamAgeGate: "[Steam 성인 연령 확인으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
     blocked: "[봇 차단으로 직접 fetch 실패 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
+    timeout: "[직접 fetch 시간 초과 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
     shell: "[직접 fetch가 SPA 셸만 반환 → Wayback Machine 스냅샷 사용 (캡처 {date}, 무료)]",
   },
   metadata: {
     steamAgeGate: "[경고: Steam 성인 연령 확인 + Perplexity 폴백 실패, 메타데이터만 추출]",
     blocked: "[경고: 봇 차단 + Perplexity 폴백 실패, 메타데이터만 추출]",
+    timeout: "[경고: 직접 fetch 시간 초과 + Perplexity 폴백 실패, 메타데이터만 추출]",
     shell: "[경고: JS 렌더링 + Perplexity 폴백 실패, 메타데이터만 추출]",
   },
 };
@@ -3370,8 +3770,334 @@ function failureText(flags, status) {
       return `[경고: Steam 성인 연령 확인 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
     case "blocked":
       return `[경고: 봇 차단 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
+    case "timeout":
+      return `[경고: 직접 fetch 시간 초과(HTTP ${status}) + 폴백 실패, 본문 추출 실패]`;
     default:
       return `[경고: 응답 본문 부족(HTTP ${status}) + Perplexity 폴백 실패]`;
+  }
+}
+
+function isHackerNewsUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase() === "news.ycombinator.com";
+  } catch {
+    return false;
+  }
+}
+
+function hackerNewsApiTarget(url) {
+  if (!isHackerNewsUrl(url)) return null;
+  const parsed = new URL(url);
+  const item = parsed.pathname === "/item" ? parsed.searchParams.get("id") : "";
+  if (/^\d+$/.test(item || "")) {
+    return { kind: "item", apiUrl: `https://hn.algolia.com/api/v1/items/${item}` };
+  }
+  const page = parsed.searchParams.get("p");
+  if ((parsed.pathname === "/" || parsed.pathname === "/news") && (!page || page === "1")) {
+    return { kind: "front_page", apiUrl: "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30" };
+  }
+  return null;
+}
+
+function hackerNewsCommentCount(children) {
+  let count = 0;
+  for (const child of Array.isArray(children) ? children : []) {
+    count += 1 + hackerNewsCommentCount(child?.children);
+  }
+  return count;
+}
+
+// HN separates paragraphs with a bare <p> and never closes it, so the generic
+// converter, which breaks lines on closing tags, would run them together.
+function hackerNewsHtmlToText(html, mode, linkOpts) {
+  return htmlToText(String(html || "").split(/<p>/i).join("\n\n"), mode, linkOpts);
+}
+
+function extractHackerNewsItemData(url, json, opts = {}) {
+  if (!isHackerNewsUrl(url) || !json || !json.id) return null;
+  const mode = opts.cleaning_mode || "balanced";
+  const linkOpts = { include_links: opts.include_links !== false, base_url: url };
+  const title = cleanText(json.title || (json.author ? `Comment by ${json.author}` : "Hacker News item"), mode);
+  const body = hackerNewsHtmlToText(json.text, mode, linkOpts);
+  const numComments = hackerNewsCommentCount(json.children);
+  const comments = [];
+
+  const visit = (children, depth) => {
+    if (depth > 10 || comments.length >= 200) return;
+    for (const child of Array.isArray(children) ? children : []) {
+      if (comments.length >= 200) break;
+      const commentBody = hackerNewsHtmlToText(child?.text, mode, linkOpts);
+      if (child?.author != null || child?.text != null) {
+        comments.push({
+          author: child?.author || "deleted",
+          created: child?.created_at || "",
+          depth,
+          text: commentBody,
+        });
+      }
+      visit(child?.children, depth + 1);
+    }
+  };
+  visit(json.children, 0);
+
+  const facts = [
+    "Site: Hacker News",
+    `Type: ${json.type || "story"}`,
+    json.author ? `Author: ${json.author}` : "",
+    Number.isFinite(Number(json.points)) ? `Points: ${Number(json.points)}` : "",
+    `Comments: ${numComments}`,
+    json.created_at ? `Published: ${json.created_at}` : "",
+  ].filter(Boolean).join(" | ");
+  const commentLines = comments.map((comment, index) => {
+    const indent = "  ".repeat(comment.depth);
+    const date = comment.created ? String(comment.created).slice(0, 10) : "unknown date";
+    const text = comment.text.replace(/\n/g, `\n${indent}`);
+    return `${indent}[C${index + 1}] ${comment.author} (${date}): ${text}`;
+  });
+  const canonical = `https://news.ycombinator.com/item?id=${json.id}`;
+  const storyId = json.story_id;
+  const text = [
+    `# ${title}`,
+    facts,
+    json.url ? `Link: ${json.url}` : "",
+    json.type === "comment" && storyId && Number(storyId) !== Number(json.id)
+      ? `Story: https://news.ycombinator.com/item?id=${storyId}`
+      : "",
+    body,
+    commentLines.length ? `Top comments:\n\n${commentLines.join("\n\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  return {
+    text,
+    meta: compactObject({
+      title,
+      description: body.slice(0, 500),
+      canonical,
+      author: json.author,
+      published: json.created_at,
+      siteName: "Hacker News",
+      type: "hn_item",
+    }),
+    structured: compactObject({
+      type: "hn_item",
+      id: json.id,
+      item_type: json.type,
+      title,
+      author: json.author,
+      points: Number.isFinite(Number(json.points)) ? Number(json.points) : undefined,
+      published: json.created_at,
+      url: json.url,
+      story_id: storyId,
+      parent_id: json.parent_id,
+      num_comments: numComments,
+      // The comment tree is already the body; repeating it here would double
+      // the tokens, because the text header prints structured data in full.
+      comments_shown: comments.length,
+    }),
+  };
+}
+
+function extractHackerNewsFrontPageData(url, json, opts = {}) {
+  if (!isHackerNewsUrl(url) || !Array.isArray(json?.hits)) return null;
+  const includeLinks = opts.include_links !== false;
+  const items = json.hits.map((hit) => compactObject({
+    id: hit.objectID || hit.story_id,
+    title: decodeEntities(hit.title || ""),
+    url: hit.url,
+    points: Number.isFinite(Number(hit.points)) ? Number(hit.points) : undefined,
+    author: hit.author,
+    num_comments: Number.isFinite(Number(hit.num_comments)) ? Number(hit.num_comments) : undefined,
+  })).filter((item) => item.id && item.title);
+  const lines = items.map((item, index) => {
+    const title = includeLinks && item.url ? markdownLink(item.title, item.url) : item.title;
+    const details = `${item.points ?? 0} points by ${item.author || "unknown"}, ${item.num_comments ?? 0} comments`;
+    const discussion = includeLinks ? ` — https://news.ycombinator.com/item?id=${item.id}` : "";
+    return `${index + 1}. ${title} — ${details}${discussion}`;
+  });
+  return {
+    text: [`# Hacker News front page`, ...lines].join("\n"),
+    meta: compactObject({ title: "Hacker News front page", canonical: "https://news.ycombinator.com/", siteName: "Hacker News", type: "hn_front_page" }),
+    structured: { type: "hn_front_page", items },
+  };
+}
+
+function stackExchangeQuestionTarget(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const fixed = new Set(["stackoverflow.com", "superuser.com", "serverfault.com", "askubuntu.com", "mathoverflow.net", "stackapps.com"]);
+    const allowed = fixed.has(host) || host.endsWith(".stackoverflow.com") || host.endsWith(".stackexchange.com");
+    if (!allowed) return null;
+    let match = parsed.pathname.match(/^\/(?:questions|q)\/(\d+)(?:\/|$)/);
+    if (match) return { site: host, questionId: match[1] };
+    match = parsed.pathname.match(/^\/a\/(\d+)(?:\/|$)/);
+    return match ? { site: host, answerId: match[1] } : null;
+  } catch {
+    return null;
+  }
+}
+
+function unixSecondsIso(value) {
+  return Number.isFinite(Number(value)) ? new Date(Number(value) * 1000).toISOString() : "";
+}
+
+function extractStackExchangeQuestionData(url, questionJson, answersJson, opts = {}) {
+  const target = stackExchangeQuestionTarget(url);
+  const question = questionJson?.items?.[0];
+  if (!target || !question || questionJson.error_id || answersJson?.error_id) return null;
+  const mode = opts.cleaning_mode || "balanced";
+  const linkOpts = { include_links: opts.include_links !== false, base_url: question.link || url };
+  const title = cleanText(decodeEntities(question.title || ""), mode);
+  const body = htmlToText(question.body || "", mode, linkOpts);
+  const siteName = target.site === "stackoverflow.com" ? "Stack Overflow" : target.site;
+  const published = unixSecondsIso(question.creation_date);
+  const answers = Array.isArray(answersJson?.items) ? answersJson.items : [];
+  const answerBlocks = answers.map((answer, index) => {
+    const author = decodeEntities(answer.owner?.display_name || "unknown");
+    const created = unixSecondsIso(answer.creation_date);
+    const labels = [answer.is_accepted ? "accepted" : "", answer._linked ? "linked" : ""].filter(Boolean).map((label) => `(${label})`).join(" ");
+    const header = `[A${index + 1}]${labels ? ` ${labels}` : ""} score ${Number(answer.score) || 0} · ${author} (${created.slice(0, 10) || "unknown date"}):`;
+    return `${header}\n${htmlToText(answer.body || "", mode, linkOpts)}`;
+  });
+  const facts = [
+    `Site: ${siteName}`,
+    `Score: ${Number(question.score) || 0}`,
+    `Answers: ${Number(question.answer_count) || 0}`,
+    `Views: ${Number(question.view_count) || 0}`,
+    Array.isArray(question.tags) && question.tags.length ? `Tags: ${question.tags.join(", ")}` : "",
+    published ? `Asked: ${published}` : "",
+    question.owner?.display_name ? `Author: ${decodeEntities(question.owner.display_name)}` : "",
+  ].filter(Boolean).join(" | ");
+  const author = decodeEntities(question.owner?.display_name || "");
+
+  return {
+    text: [`# ${title}`, facts, body, answerBlocks.length ? `Answers (sorted by votes):\n\n${answerBlocks.join("\n\n")}` : ""].filter(Boolean).join("\n\n"),
+    meta: compactObject({ title, description: body.slice(0, 500), canonical: question.link, author, published, siteName, type: "stackexchange_question" }),
+    structured: compactObject({
+      type: "stackexchange_question",
+      site: target.site,
+      question_id: question.question_id,
+      title,
+      score: question.score,
+      answer_count: question.answer_count,
+      view_count: question.view_count,
+      tags: question.tags,
+      is_answered: question.is_answered,
+      accepted_answer_id: question.accepted_answer_id,
+      author,
+      published,
+      answers: answers.map((answer) => compactObject({
+        answer_id: answer.answer_id,
+        score: answer.score,
+        is_accepted: answer.is_accepted,
+        author: decodeEntities(answer.owner?.display_name || ""),
+        created: unixSecondsIso(answer.creation_date),
+      })),
+      quota_remaining: questionJson.quota_remaining,
+    }),
+  };
+}
+
+async function fetchJsonApi(url, signal) {
+  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": DESKTOP_CHROME_UA }, signal });
+  const json = await response.json();
+  if (!response.ok || json?.error_id || json?.error_name) {
+    throw new Error(json?.error_name || `HTTP ${response.status}`);
+  }
+  return {
+    json,
+    status: response.status,
+    finalUrl: response.url || url,
+    contentType: response.headers.get("content-type") || "application/json",
+    contentLength: response.headers.get("content-length") || "",
+  };
+}
+
+async function trySiteApiFirst(url, opts, signal, warnings, debugInfo) {
+  if (opts.site_preset !== "auto") return null;
+  const hnTarget = hackerNewsApiTarget(url);
+  const seTarget = stackExchangeQuestionTarget(url);
+  if (!hnTarget && !seTarget) return null;
+
+  try {
+    let page;
+    let responseInfo;
+    let source;
+    let urlKind;
+    let warning;
+    let apiUrl;
+    let rawJson;
+    if (hnTarget) {
+      apiUrl = hnTarget.apiUrl;
+      responseInfo = await fetchJsonApi(apiUrl, signal);
+      if (!responseInfo) throw new Error("Hacker News item was not found");
+      rawJson = responseInfo.json;
+      page = hnTarget.kind === "item"
+        ? extractHackerNewsItemData(url, rawJson, opts)
+        : extractHackerNewsFrontPageData(url, rawJson, opts);
+      source = "hn-algolia";
+      urlKind = "hn-algolia";
+      warning = "Hacker News HTML은 Worker를 차단하므로 Algolia 공식 API로 가져옴";
+    } else {
+      let questionId = seTarget.questionId;
+      let linkedAnswer = null;
+      if (seTarget.answerId) {
+        apiUrl = `https://api.stackexchange.com/2.3/answers/${seTarget.answerId}?site=${encodeURIComponent(seTarget.site)}&filter=withbody`;
+        const linkedResponse = await fetchJsonApi(apiUrl, signal);
+        linkedAnswer = linkedResponse?.json?.items?.[0] || null;
+        questionId = linkedAnswer?.question_id;
+        if (!questionId) throw new Error("linked answer was not found");
+      }
+      const questionUrl = `https://api.stackexchange.com/2.3/questions/${questionId}?site=${encodeURIComponent(seTarget.site)}&filter=withbody`;
+      const answersUrl = `https://api.stackexchange.com/2.3/questions/${questionId}/answers?site=${encodeURIComponent(seTarget.site)}&filter=withbody&sort=votes&order=desc&pagesize=10`;
+      apiUrl = questionUrl;
+      const [questionResponse, answersResponse] = await Promise.all([fetchJsonApi(questionUrl, signal), fetchJsonApi(answersUrl, signal)]);
+      if (!questionResponse || !answersResponse) throw new Error("Stack Exchange question or answers were not found");
+      if (linkedAnswer) {
+        const linkedId = Number(linkedAnswer.answer_id);
+        const answers = answersResponse.json.items || [];
+        const index = answers.findIndex((answer) => Number(answer.answer_id) === linkedId);
+        const selected = index >= 0 ? answers.splice(index, 1)[0] : linkedAnswer;
+        answers.unshift({ ...selected, _linked: true });
+      }
+      rawJson = { question: questionResponse.json, answers: answersResponse.json };
+      responseInfo = questionResponse;
+      page = extractStackExchangeQuestionData(url, questionResponse.json, answersResponse.json, opts);
+      source = "stackexchange-api";
+      urlKind = "stackexchange-api";
+      warning = "Stack Exchange HTML은 Worker를 차단하므로 공식 API로 가져옴";
+    }
+    if (!page) return null;
+    warnings.push(warning);
+    debugInfo?.attempts?.push({
+      ua: 1,
+      url: apiUrl,
+      urlKind,
+      status: responseInfo.status,
+      finalUrl: responseInfo.finalUrl,
+      contentType: responseInfo.contentType,
+      contentLength: responseInfo.contentLength,
+      bodyChars: JSON.stringify(rawJson).length,
+    });
+    const html = JSON.stringify(rawJson);
+    return {
+      ok: true,
+      text: page.text,
+      html,
+      status: responseInfo.status,
+      attempt: 1,
+      attempt_total: 1,
+      warnings,
+      source,
+      meta: page.meta,
+      finalUrl: url,
+      contentType: responseInfo.contentType,
+      contentLength: responseInfo.contentLength || String(html.length),
+      structured: page.structured,
+    };
+  } catch (err) {
+    warnings.push(`사이트 무료 API 우선 fetch 실패: ${String(err).slice(0, 200)}`);
+    return null;
   }
 }
 
@@ -3449,7 +4175,7 @@ async function trySagePmcMirror(url, opts, signal, warnings, attemptTotal) {
 // refuse, error, or time out — the search fallback still gets its turn, because
 // a robots-disallowed page is usually still indexed and searchable.
 // Returns { text, source } or null.
-async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
+async function fetchRemoteBody(url, maxChars, apiKey, warnings, deadline) {
   if (!apiKey) return null;
   const remoteUrls = namuRemoteDocumentUrls(url);
   const readableUrl = remoteUrls[0];
@@ -3462,30 +4188,59 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings) {
     warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
   }
 
-  try {
-    // A two-URL fetch of the blocked Korean revision plus the working English
-    // frontend exceeded our 20 s budget in production. Fetch only the exact
-    // English revision; the query identity check makes this safe.
-    const agentTimeout = remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS;
-    const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
-    if (agent.text) {
-      if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
-        warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
-      }
-      return { text: agent.text, source: "agent-fetch-url" };
+  const runLimited = (fn) => deadline?.limiter ? deadline.limiter.run(fn) : fn();
+
+  // A two-URL fetch of the blocked Korean revision plus the working English
+  // frontend exceeded our 20 s budget in production. Fetch only the exact
+  // English revision; the query identity check makes this safe.
+  const agentLimit = deadline?.agent_limit_ms
+    ?? (remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS);
+  const agentResult = await runLimited(async () => {
+    const stageStart = Date.now();
+    const agentTimeout = deadline ? Math.min(agentLimit, deadline.remaining() - 8_000) : agentLimit;
+    if (deadline && agentTimeout < (deadline.agent_min_ms ?? 6_000)) {
+      warnings.push("시간 예산 부족으로 Perplexity fetch_url 생략");
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, "skipped: budget");
+      return null;
     }
-    if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
-  } catch (err) {
-    warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
-  }
+    try {
+      const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
+      if (agent.text) {
+        if (agent.url && new URL(agent.url).hostname === "en.namu.wiki") {
+          warnings.push(`나무위키 한국어 과거판이 차단되어 같은 rev의 영어 프런트엔드로 확인: ${agent.url}`);
+        }
+        recordDeadlineStage(deadline, "agent-fetch-url", stageStart, true);
+        return { text: agent.text, source: "agent-fetch-url" };
+      }
+      if (agent.reason) warnings.push(`Perplexity fetch_url 실패: ${agent.reason}`);
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, agent.reason || "no content");
+    } catch (err) {
+      warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, err?.name === "AbortError" ? "timeout" : String(err).slice(0, 80));
+    }
+    return null;
+  });
+  if (agentResult) return agentResult;
 
   // Always reached, whatever happened above.
-  try {
-    const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey);
-    if (searched) return { text: searched, source: "perplexity" };
-  } catch (err) {
-    warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
-  }
+  const searchResult = await runLimited(async () => {
+    const searchStart = Date.now();
+    if (deadline && Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000) < 4_000) {
+      warnings.push("시간 예산 부족으로 Perplexity 검색 폴백 생략");
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, false, "skipped: budget");
+      return null;
+    }
+    try {
+      const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey, deadline);
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, !!searched, searched ? undefined : "no matching result");
+      return searched ? { text: searched, source: "perplexity" } : null;
+    } catch (err) {
+      warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, false, String(err).slice(0, 80));
+      return null;
+    }
+  });
+  if (searchResult) return searchResult;
   return null;
 }
 
@@ -3507,63 +4262,108 @@ function waybackOriginalUrl(snapshotUrl) {
   return match ? match[1] : "";
 }
 
-async function tryWaybackSnapshot(url, opts, warnings, attemptTotal) {
+async function tryWaybackSnapshot(url, opts, warnings, attemptTotal, deadline) {
+  const stageStart = Date.now();
+  if (deadline && deadline.remaining() < 4_000) {
+    warnings.push("시간 예산 부족으로 Wayback 조회 생략");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "skipped: budget");
+    return null;
+  }
   // /raw/ documents are archived under their readable /w/ identity, if at all.
   const lookupUrl = namuReadableDocumentUrl(url);
   let closest;
   const availabilityController = new AbortController();
-  const availabilityTimer = setTimeout(() => availabilityController.abort(), WAYBACK_AVAILABILITY_TIMEOUT_MS);
+  const availabilityTimeout = deadline
+    ? Math.min(WAYBACK_AVAILABILITY_TIMEOUT_MS, deadline.remaining())
+    : WAYBACK_AVAILABILITY_TIMEOUT_MS;
+  const availabilityTimer = setTimeout(() => availabilityController.abort(), availabilityTimeout);
   try {
     const res = await fetch(`https://archive.org/wayback/available?url=${encodeURIComponent(lookupUrl)}`, {
       headers: { "User-Agent": USER_AGENTS[1], Accept: "application/json" },
       signal: availabilityController.signal,
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      warnings.push(`Wayback 조회 실패: HTTP ${res.status}`);
+      recordDeadlineStage(deadline, "wayback", stageStart, false, `HTTP ${res.status}`);
+      return null;
+    }
     closest = (await res.json())?.archived_snapshots?.closest;
   } catch (err) {
-    warnings.push(`Wayback 조회 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    const note = err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120);
+    warnings.push(`Wayback 조회 실패: ${note}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, note);
     return null;
   } finally {
     clearTimeout(availabilityTimer);
   }
-  if (!closest?.available || String(closest.status) !== "200" || !closest.url) return null;
+  if (!closest?.available || String(closest.status) !== "200" || !closest.url) {
+    warnings.push("Wayback: 이 URL의 캡처 없음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "no capture");
+    return null;
+  }
   // The archive answers near-miss URLs too; only the requested document will
   // do, for the same reason as the search fallback below.
-  if (!sameDocument(lookupUrl, waybackOriginalUrl(closest.url))) return null;
+  if (!sameDocument(lookupUrl, waybackOriginalUrl(closest.url))) {
+    warnings.push("Wayback: 가장 가까운 캡처가 다른 문서라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "different document");
+    return null;
+  }
 
   const snapshotUrl = String(closest.url)
     .replace(/^http:\/\//i, "https://")
     .replace(/(\/web\/\d{4,14})\//, "$1id_/");
-  if (!isSafeFetchUrl(snapshotUrl)) return null;
+  if (!isSafeFetchUrl(snapshotUrl)) {
+    warnings.push("Wayback: 가장 가까운 캡처가 다른 문서라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "unsafe snapshot URL");
+    return null;
+  }
 
   let page;
   const snapshotController = new AbortController();
-  const snapshotTimer = setTimeout(() => snapshotController.abort(), WAYBACK_SNAPSHOT_TIMEOUT_MS);
+  const snapshotTimeout = deadline
+    ? Math.min(WAYBACK_SNAPSHOT_TIMEOUT_MS, deadline.remaining())
+    : WAYBACK_SNAPSHOT_TIMEOUT_MS;
+  const snapshotTimer = setTimeout(() => snapshotController.abort(), snapshotTimeout);
   try {
     page = await fetchOnce(snapshotUrl, USER_AGENTS[1], snapshotController.signal, new Map(), "auto");
   } catch (err) {
-    warnings.push(`Wayback 스냅샷 fetch 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
+    const note = err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120);
+    warnings.push(`Wayback 스냅샷 fetch 실패: ${note}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, note);
     return null;
   } finally {
     clearTimeout(snapshotTimer);
   }
-  if (!(page.status >= 200 && page.status < 300) || !page.body) return null;
+  if (!(page.status >= 200 && page.status < 300) || !page.body) {
+    warnings.push(`Wayback 스냅샷 응답 이상: HTTP ${page.status}`);
+    recordDeadlineStage(deadline, "wayback", stageStart, false, `HTTP ${page.status}`);
+    return null;
+  }
   // The archive faithfully replays whatever it crawled — including an archived
   // challenge page. That capture proves nothing except that the WAF was on.
-  if (looksBlocked(200, page.body, lookupUrl)) return null;
+  if (looksBlocked(200, page.body, lookupUrl)) {
+    warnings.push("Wayback: 캡처가 차단 페이지라 사용하지 않음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "blocked capture");
+    return null;
+  }
 
   // Extract with the ORIGINAL url so the site preset (namu, news, …) applies
   // and relative links resolve against the origin, not web.archive.org.
   const sitePage = extractSitePage(lookupUrl, page.body, opts.site_preset, opts.cleaning_mode, opts);
   const text = sitePage?.text
     || htmlToText(page.body, opts.cleaning_mode, { include_links: opts.include_links, base_url: lookupUrl });
-  if (!sitePage && !hasMeaningfulHtmlContent(page.body, text)) return null;
+  if (!sitePage && !hasMeaningfulHtmlContent(page.body, text)) {
+    warnings.push("Wayback: 캡처에 본문 없음");
+    recordDeadlineStage(deadline, "wayback", stageStart, false, "no content");
+    return null;
+  }
 
   const timestamp = String(closest.timestamp || "");
   const capturedAt = timestamp.length >= 8
     ? `${timestamp.slice(0, 4)}-${timestamp.slice(4, 6)}-${timestamp.slice(6, 8)}`
     : "unknown";
   warnings.push(`직접 fetch가 차단되어 Wayback Machine 스냅샷(${capturedAt} 캡처)으로 대체: ${snapshotUrl} — 캡처 이후의 편집은 반영되지 않습니다.`);
+  recordDeadlineStage(deadline, "wayback", stageStart, true);
 
   const meta = sitePage?.meta || extractMetadata(page.body);
   for (const field of ["title", "author", "published"]) {
@@ -3590,9 +4390,9 @@ async function tryWaybackSnapshot(url, opts, warnings, attemptTotal) {
 // Every direct attempt is spent. Walk the remaining ladder — document handling,
 // the paid Perplexity site: fallback, page metadata — and return whatever still
 // carries information, rather than nothing at all. Caller applies finish().
-async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags }) {
+async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal, last, flags, deadline }) {
   if (flags.document) {
-    const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+    const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings, deadline);
     if (remote) {
       return {
         ok: true,
@@ -3632,7 +4432,7 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
   // age-gated pages are skipped: their captures are the gate itself.
   const tryWayback = async () => {
     if (flags.steamAgeGate) return null;
-    const archived = await tryWaybackSnapshot(url, opts, warnings, attemptTotal);
+    const archived = await tryWaybackSnapshot(url, opts, warnings, attemptTotal, deadline);
     if (!archived) return null;
     return {
       ...archived,
@@ -3645,8 +4445,18 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
     if (archived) return archived;
   }
 
+  // Reddit refuses Workers and Perplexity's fetcher alike and keeps the
+  // Internet Archive out, so for a post the Arctic Shift archive comes before
+  // any paid call. Listings and other pages have no archive entry and skip it.
+  if (opts.site_preset === "reddit" && redditPostIdFromUrl(url)) {
+    const stageStart = Date.now();
+    const archived = await tryRedditArchive(url, opts, warnings, attemptTotal, deadline);
+    recordDeadlineStage(deadline, "reddit-archive", stageStart, !!archived);
+    if (archived) return archived;
+  }
+
   // Paid, but works on Cloudflare-protected SPAs that pre-render for no UA.
-  const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings);
+  const remote = await fetchRemoteBody(url, FETCH_MAX_CHARS_LIMIT, apiKey, warnings, deadline);
   if (remote) {
     return {
       ok: true,
@@ -3708,8 +4518,16 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   const cached = await readFetchCache(url, normalizedOpts);
   if (cached) return cached;
 
+  const deadline = createDeadline(opts.deadline_ms ?? FETCH_DEADLINE_MS);
+  deadline.limiter = opts.remote_limiter;
+  deadline.agent_limit_ms = opts.agent_timeout_ms;
+  deadline.agent_min_ms = opts.agent_min_timeout_ms;
   const overallController = new AbortController();
-  const overallTimer = setTimeout(() => overallController.abort(), FETCH_TOTAL_BUDGET_MS);
+  const overallTimer = setTimeout(
+    () => overallController.abort(),
+    Math.min(FETCH_TOTAL_BUDGET_MS, deadline.remaining())
+  );
+  const directStartedAt = Date.now();
 
   let lastStatus = 0;
   let lastBody = "";
@@ -3719,6 +4537,8 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   let blockedSeen = false;
   let steamAgeGateSeen = false;
   let documentSeen = false;
+  let timedOutSeen = false;
+  let directStageRecorded = false;
   const warnings = [];
   const cookieJar = new Map();
   const debugInfo = {
@@ -3729,6 +4549,13 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
     cache: "miss",
     attempts: [],
     clientRedirects: [],
+    stages: [],
+  };
+  deadline.stages = debugInfo.stages;
+  const recordDirectStage = (ok) => {
+    if (directStageRecorded) return;
+    directStageRecorded = true;
+    debugInfo.stages.push({ stage: "direct", ms: Date.now() - directStartedAt, ok });
   };
   applySitePresetCookies(cookieJar, normalizedOpts.site_preset);
   const userAgents = userAgentsForSitePreset(normalizedOpts.site_preset);
@@ -3738,6 +4565,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   }
 
   const finish = async (result) => {
+    recordDirectStage(true);
     const enriched = {
       ...result,
       attempt_total: result.attempt_total || userAgents.length,
@@ -3757,14 +4585,26 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   try {
     if (normalizedOpts.site_preset === "sourceforge") {
       const page = await trySourceForgeAlluraRest(url, normalizedOpts, overallController.signal, warnings, debugInfo);
-      if (page) return finish(page);
+      if (page) {
+        recordDirectStage(true);
+        return finish(page);
+      }
+    }
+
+    // Hacker News and Stack Exchange refuse Worker egress outright, so their
+    // official APIs go first, like SourceForge's REST endpoint above.
+    const apiPage = await trySiteApiFirst(url, normalizedOpts, overallController.signal, warnings, debugInfo);
+    if (apiPage) {
+      recordDirectStage(true);
+      return finish(apiPage);
     }
 
     for (let i = 0; i < userAgents.length; i++) {
       if (overallController.signal.aborted) break;
 
       const attemptController = new AbortController();
-      const attemptTimer = setTimeout(() => attemptController.abort(), FETCH_PER_ATTEMPT_MS);
+      const attemptTimeout = opts.attempt_timeout_ms ?? FETCH_PER_ATTEMPT_MS;
+      const attemptTimer = setTimeout(() => attemptController.abort(), attemptTimeout);
       const composite = new AbortController();
       const onAbort = () => composite.abort();
       overallController.signal.addEventListener("abort", onAbort);
@@ -3790,6 +4630,10 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           redirectCount++;
         }
       } catch (err) {
+        const attemptTimedOut = err?.name === "AbortError"
+          && attemptController.signal.aborted
+          && !overallController.signal.aborted;
+        if (attemptTimedOut) timedOutSeen = true;
         warnings.push(`UA #${i + 1} 실패: ${err && err.name === "AbortError" ? "timeout" : String(err).slice(0, 120)}`);
       } finally {
         clearTimeout(attemptTimer);
@@ -3813,6 +4657,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         contentLength,
         bodyChars: body.length,
       });
+      if (timedOutSeen) break;
 
       if (status >= 200 && status < 300 && isDocumentResponse(lastFinalUrl, contentType)) {
         documentSeen = true;
@@ -3853,10 +4698,16 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         continue;
       }
 
+      if (overallController.signal.aborted) {
+        timedOutSeen = true;
+        break;
+      }
+
       if (normalizedOpts.site_preset === "sage" && body) {
         const sageArticle = extractSageArticleData(lastFinalUrl, body, normalizedOpts.cleaning_mode, normalizedOpts);
         if (sageArticle) {
           if (status >= 400) warnings.push(`UA #${i + 1}: extracted SAGE article body despite HTTP ${status}`);
+          recordDirectStage(true);
           return finish({
             ok: true,
             text: sageArticle.text,
@@ -3900,6 +4751,11 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           overallController.signal.removeEventListener("abort", onChallengeAbort);
           challengeController.signal.removeEventListener("abort", onChallengeAbort);
         }
+      }
+
+      if (overallController.signal.aborted) {
+        timedOutSeen = true;
+        break;
       }
 
       if (looksBlocked(status, body, lastFinalUrl)) {
@@ -3950,6 +4806,7 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           if (dcComments) {
             structured = { ...(structured || {}), comment_count: dcComments.total, comments: dcComments.items };
           }
+          recordDirectStage(true);
           return finish({
             ok: true,
             text,
@@ -3970,6 +4827,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         continue;
       }
     }
+
+    if (overallController.signal.aborted) timedOutSeen = true;
+    recordDirectStage(false);
 
     if (normalizedOpts.site_preset === "sage") {
       const article = await trySagePmcMirror(url, normalizedOpts, overallController.signal, warnings, userAgents.length);
@@ -3996,7 +4856,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         blocked: blockedSeen,
         steamAgeGate: steamAgeGateSeen,
         document: documentSeen,
+        timedOut: timedOutSeen,
       },
+      deadline,
     }));
   } finally {
     clearTimeout(overallTimer);
@@ -4119,7 +4981,7 @@ async function fetchViaAgentUrlTool(url, maxChars, apiKey, timeoutMs = AGENT_FET
   return { text: parts.join("\n").slice(0, maxChars), reason: "", url: entry.url };
 }
 
-async function fetchViaPerplexity(url, maxChars, apiKey) {
+async function fetchViaPerplexity(url, maxChars, apiKey, deadline) {
   let host, segments;
   try {
     const u = new URL(url);
@@ -4158,6 +5020,10 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
   for (const keywords of candidates) {
     const query = keywords.slice(0, 200).trim();
     if (!query || isOpaqueSlug(query)) continue;
+    const timeout = deadline
+      ? Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000)
+      : SEARCH_FALLBACK_TIMEOUT_MS;
+    if (timeout < 4_000) break;
     try {
       // Use official search_domain_filter (allowlist for the host) instead of `site:` query operator.
       // Ask for several results: the requested document is not always ranked first.
@@ -4166,7 +5032,7 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
         max_results: 5,
         max_tokens_per_page: 2048,
         search_domain_filter: [host],
-      }, apiKey, SEARCH_FALLBACK_TIMEOUT_MS);
+      }, apiKey, timeout);
       const data = await response.json();
       const results = Array.isArray(data?.results) ? data.results : [];
       // Only the requested document will do. A near-miss on the same domain is
@@ -4184,7 +5050,10 @@ async function fetchViaPerplexity(url, maxChars, apiKey) {
         ].filter(Boolean);
         return parts.join("\n").slice(0, maxChars);
       }
-    } catch { /* try next candidate */ }
+    } catch (err) {
+      if (err?.status === 429) break;
+      // Try the next candidate for non-rate-limit failures.
+    }
   }
   return null;
 }
@@ -4210,33 +5079,73 @@ function paginateText(text, pageSize, requestedPage) {
 
 // ── Perplexity /search ──────────────────────────────────────────────
 
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let sleep = defaultSleep;
+
+function __setSleepForTests(fn) {
+  sleep = typeof fn === "function" ? fn : defaultSleep;
+}
+
 async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "User-Agent": `perplexity-mcp/${VERSION}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    if (!res.ok) {
-      let errorText;
-      try { errorText = await res.text(); } catch { errorText = "Unable to parse error response"; }
-      throw new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${errorText}`);
-    }
-    return res;
-  } catch (err) {
-    if (err && err.name === "AbortError") {
+  const end = Date.now() + timeoutMs;
+  let retries = 0;
+  let last429Error = null;
+
+  while (true) {
+    const remaining = end - Date.now();
+    if (remaining <= 0) {
+      if (last429Error) throw last429Error;
       throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
     }
-    throw err;
-  } finally {
-    clearTimeout(timer);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remaining);
+    let res;
+    let responseText;
+    try {
+      res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "User-Agent": `perplexity-mcp/${VERSION}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      responseText = await res.text();
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.ok) {
+      return new Response(responseText, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
+    }
+
+    const error = Object.assign(
+      new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${responseText}`),
+      { status: res.status }
+    );
+    if (res.status !== 429 || retries >= 1) throw error;
+    last429Error = error;
+
+    const retryAfterHeader = res.headers.get("retry-after");
+    const retryAfter = Number(retryAfterHeader);
+    const backoff = retryAfterHeader !== null && Number.isFinite(retryAfter) && retryAfter >= 0
+      ? retryAfter * 1_000
+      : 1_000 * 2 ** retries + Math.floor(Math.random() * 400);
+    retries++;
+    await sleep(Math.min(4_000, backoff, Math.max(0, end - Date.now())));
+    if (end - Date.now() < 2_000) throw last429Error;
   }
 }
 
@@ -4510,6 +5419,7 @@ function formatDebugBlock(debugInfo) {
     `  cleaned_chars: ${debugInfo.cleanedChars ?? "n/a"}`,
     debugInfo.clientRedirects?.length ? `  client_redirects: ${debugInfo.clientRedirects.map((r) => `${r.kind}:${r.to}`).join(" | ")}` : null,
     debugInfo.attempts?.length ? `  attempts: ${debugInfo.attempts.map((a) => `#${a.ua}${a.urlKind ? ` ${a.urlKind}` : ""} ${a.status} ${a.contentType || "unknown"} ${a.bodyChars} chars`).join(" | ")}` : null,
+    debugInfo.stages?.length ? `  stages: ${debugInfo.stages.map((s) => `${s.stage} ${s.ms}ms ${s.ok ? "ok" : `fail${s.note ? `(${s.note})` : ""}`}`).join(" | ")}` : null,
   ].filter(Boolean).join("\n");
 }
 
@@ -4573,12 +5483,16 @@ function formatFetchResult(url, result, opts = {}) {
 }
 
 async function fetchAndFormat(url, apiKey, opts = {}) {
+  const toolStart = opts.tool_started_at ?? Date.now();
   const result = await fetchPageWithFallbacks(url, apiKey, opts);
   let text = formatFetchResult(url, result, opts);
   let imageContent = [];
-  if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length) {
+  const imageBudget = Math.min(IMAGE_FETCH_BUDGET_MS, TOOL_DEADLINE_MS - (Date.now() - toolStart));
+  if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length && imageBudget < 2_000) {
+    text += "\n\n[이미지 첨부 생략: 시간 예산 부족]";
+  } else if (opts.include_images && Array.isArray(result.imageUrls) && result.imageUrls.length) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), IMAGE_FETCH_BUDGET_MS);
+    const timer = setTimeout(() => controller.abort(), imageBudget);
     try {
       const { blocks, images, notes } = await collectImageBlocks(result.imageUrls, result.finalUrl || url, controller.signal, opts);
       imageContent = blocks;
@@ -4657,6 +5571,7 @@ const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
   "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
+  "Hacker News items and Stack Exchange questions are read through their official APIs (source: hn-algolia / stackexchange-api); blocked Reddit posts come from the Arctic Shift archive (source: reddit-archive, scores and comments as of capture); YouTube watch pages include the video description.",
   "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
   "If the body exceeds max_chars, call again with the same URL and page+1.",
 ].join(" ");
@@ -4924,7 +5839,7 @@ function createServer(apiKey) {
       outputSchema: FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
-      const opts = normalizeFetchOpts(args);
+      const opts = normalizeFetchOpts(args, { tool_started_at: Date.now() });
       const { result, text, imageContent } = await fetchAndFormat(args.url, apiKey, opts);
       const structuredContent = buildFetchStructured(args.url, result, text, opts);
       // Text first, then any image blocks collected for multimodal clients.
@@ -4943,27 +5858,36 @@ function createServer(apiKey) {
       outputSchema: FETCH_MANY_OUTPUT_SHAPE,
     },
     async (args) => {
-      const parts = [];
-      const items = [];
-      for (let i = 0; i < args.urls.length; i++) {
-        const url = args.urls[i];
+      const toolStart = Date.now();
+      const remoteLimiter = createLimiter(2);
+      const entries = await Promise.all(args.urls.map(async (url, i) => {
         try {
-          const opts = normalizeFetchOpts(args, { max_chars: args.max_chars ?? 4000 });
+          const opts = normalizeFetchOpts(args, {
+            max_chars: args.max_chars ?? 4000,
+            tool_started_at: toolStart,
+            remote_limiter: remoteLimiter,
+          });
           const { result, text } = await fetchAndFormat(url, apiKey, opts);
-          parts.push(`## [${i + 1}] ${url}\n\n${text}`);
-          items.push(buildFetchStructured(url, result, text, opts).result);
+          return {
+            part: `## [${i + 1}] ${url}\n\n${text}`,
+            item: buildFetchStructured(url, result, text, opts).result,
+          };
         } catch (err) {
           const errorText = `Error: ${String(err).slice(0, 500)}`;
-          parts.push(`## [${i + 1}] ${url}\n\n${errorText}`);
-          items.push({
-            url,
-            source: "error",
-            text: errorText,
-            metadata: {},
-            warnings: [errorText],
-          });
+          return {
+            part: `## [${i + 1}] ${url}\n\n${errorText}`,
+            item: {
+              url,
+              source: "error",
+              text: errorText,
+              metadata: {},
+              warnings: [errorText],
+            },
+          };
         }
-      }
+      }));
+      const parts = entries.map((entry) => entry.part);
+      const items = entries.map((entry) => entry.item);
       const text = parts.join("\n\n---\n\n");
       const structuredContent = { text, count: items.length, items };
       return { content: [{ type: "text", text }], structuredContent };
@@ -4978,6 +5902,7 @@ function createServer(apiKey) {
       outputSchema: SEARCH_FETCH_OUTPUT_SHAPE,
     },
     async (args) => {
+      const toolStart = Date.now();
       const opts = normalizeSearchOpts(args, {
         max_results: args.max_results ?? Math.max(8, args.fetch_top_k ?? 3),
       });
@@ -4985,6 +5910,7 @@ function createServer(apiKey) {
       if (validationError) return toolError(validationError);
 
       const search = await runSearch(opts, apiKey);
+      const remoteLimiter = createLimiter(2);
       const topK = Math.min(args.fetch_top_k ?? 3, SEARCH_FETCH_TOP_K_LIMIT, search.results.length);
       const chunks = [
         "# Search preview",
@@ -4992,13 +5918,19 @@ function createServer(apiKey) {
         "",
         `# Fetched top ${topK}`,
       ];
-      const fetchedItems = [];
-      for (let i = 0; i < topK; i++) {
-        const result = search.results[i];
+      const fetchDeadline = Math.max(
+        15_000,
+        TOOL_DEADLINE_MS - (Date.now() - toolStart) - 5_000
+      );
+      const fetchedEntries = await Promise.all(search.results.slice(0, topK).map(async (result, i) => {
         try {
           // Explicit allowlist, not a spread: search arguments such as query
           // and fetch_top_k must not leak into the fetch options.
           const fetchOpts = normalizeFetchOpts({
+            url: result.url,
+            // Only text reaches this tool's output, so DCinside's automatic
+            // image attachment would be fetched and thrown away.
+            include_images: false,
             max_chars: args.fetch_chars ?? 3500,
             page: 1,
             cleaning_mode: args.cleaning_mode,
@@ -5007,22 +5939,28 @@ function createServer(apiKey) {
             include_links: args.include_links,
             debug: args.debug,
             use_cache: args.use_cache,
-          });
+          }, { deadline_ms: fetchDeadline, tool_started_at: toolStart, remote_limiter: remoteLimiter });
           const fetched = await fetchAndFormat(result.url, apiKey, fetchOpts);
-          chunks.push(`\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`);
-          fetchedItems.push(buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result);
+          return {
+            chunk: `\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`,
+            item: buildFetchStructured(result.url, fetched.result, fetched.text, fetchOpts).result,
+          };
         } catch (err) {
           const errorText = `Error: ${String(err).slice(0, 500)}`;
-          chunks.push(`\n## [${i + 1}] ${result.url}\n${errorText}`);
-          fetchedItems.push({
-            url: result.url || "",
-            source: "error",
-            text: errorText,
-            metadata: {},
-            warnings: [errorText],
-          });
+          return {
+            chunk: `\n## [${i + 1}] ${result.url}\n${errorText}`,
+            item: {
+              url: result.url || "",
+              source: "error",
+              text: errorText,
+              metadata: {},
+              warnings: [errorText],
+            },
+          };
         }
-      }
+      }));
+      chunks.push(...fetchedEntries.map((entry) => entry.chunk));
+      const fetchedItems = fetchedEntries.map((entry) => entry.item);
       const text = chunks.join("\n");
       const searchText = formatSearchResults(search, { debug: args.debug });
       const structuredContent = {
@@ -5051,6 +5989,7 @@ export {
   cleanMarkdownText,
   normalizeCleaningMode,
   htmlToText,
+  stripHtmlTagsQuoteAware,
   htmlLinksToMarkdown,
   extractLinksFromMarkdown,
   extractMetadata,
@@ -5081,6 +6020,18 @@ export {
   // Site extractors
   extractDcinsideArticleData,
   extractRedditPostData,
+  isHackerNewsUrl,
+  extractHackerNewsItemData,
+  extractHackerNewsFrontPageData,
+  stackExchangeQuestionTarget,
+  extractStackExchangeQuestionData,
+  trySiteApiFirst,
+  redditPostIdFromUrl,
+  buildRedditArchiveListing,
+  fetchRedditArchive,
+  tryRedditArchive,
+  extractYouTubeVideoData,
+  extractBalancedJson,
   extractNamuWikiData,
   cleanNamuWikiText,
   extractMediaWikiArticleData,
@@ -5107,11 +6058,16 @@ export {
   // Request shaping
   fetchHeaders,
   browserRequestHeaders,
+  chromeSecChUa,
+  CHROME_MAJOR,
 
   // Anti-bot and redirects
   extractClientRedirect,
   looksBlocked,
   looksSteamAgeGate,
+  createDeadline,
+  createLimiter,
+  degradationCause,
   buildSimpleChallengeSubmission,
   buildSteamAgeSubmission,
   hasMeaningfulHtmlContent,
@@ -5147,6 +6103,7 @@ export {
   runSearch,
   performSearch,
   makeApiRequest,
+  __setSleepForTests,
 
   // Fetch shaping
   formatFetchResult,

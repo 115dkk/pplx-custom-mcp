@@ -1,0 +1,8 @@
+{
+  "hits": [
+    { "objectID": "101", "title": "First story", "url": "https://example.com/first", "points": 50, "author": "alice", "num_comments": 10 },
+    { "objectID": "102", "title": "Second story", "url": "https://example.com/second", "points": 40, "author": "bob", "num_comments": 8 }
+  ],
+  "hitsPerPage": 30,
+  "page": 0
+}
