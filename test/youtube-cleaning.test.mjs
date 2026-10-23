@@ -39,7 +39,9 @@ test("YouTube player response yields video body and structured fields", () => {
   assert.match(page.text, /Length: 3:32/);
   assert.match(page.text, /Views: 12345/);
   assert.match(page.text, /Keywords: one, two, three/);
-  assert.ok(page.text.includes("https://example.com/video"), "description URLs are prose and must survive include_links=false");
+  // Description URLs are prose and must survive include_links=false. Compared
+  // whole: CodeQL reads a substring check for a URL as URL sanitization.
+  assert.equal(page.meta.description, 'Description with { braces }, an escaped quote: "yes", and literal }; plus https://example.com/video');
   assert.equal(page.structured.video_id, "abc123");
   assert.equal(page.structured.length_seconds, 212);
   assert.equal(page.structured.view_count, 12345);
