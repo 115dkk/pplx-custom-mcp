@@ -279,6 +279,30 @@ test("core: metadata_only returns metadata without the body", async () => {
   }
 });
 
+test("core: script redirects count only on near-empty interstitial pages", () => {
+  // Naver's mobile hop: an inline script and nothing else, slashes escaped.
+  const naverHop = `<html><head><script language="JavaScript" >\n\ttop.location.replace('https:\\/\\/m.blog.naver.com\\/PostView.naver?blogId=a&logNo=1');\n</script></head><body></body></html>`;
+  assert.deepEqual(extractClientRedirect("https://blog.naver.com/a/1", naverHop), {
+    url: "https://m.blog.naver.com/PostView.naver?blogId=a&logNo=1",
+    kind: "javascript-redirect",
+  });
+
+  const plainHop = `<script>window.location.href = "/landing";</script><p>Redirecting…</p>`;
+  assert.equal(extractClientRedirect("https://example.com/go", plainHop)?.url, "https://example.com/landing");
+
+  // Tistory: the search box handler builds a URL by concatenation inside an
+  // event attribute. Neither that nor an article page is a redirect.
+  const article = `<p>${"본문 문장입니다. ".repeat(80)}</p>`;
+  const tistoryPost = `<input name="search" onkeypress="if (event.keyCode == 13) { window.location.href = '/search' + '/' + q; }">${article}`;
+  assert.equal(extractClientRedirect("https://blog.tistory.com/689", tistoryPost), null);
+
+  const concatenated = `<script>function go(q) { window.location.href = '/search' + '/' + q; }</script>`;
+  assert.equal(extractClientRedirect("https://blog.tistory.com/689", concatenated), null);
+
+  const articleWithScript = `<script>if (!ok) { location.href = "/login"; }</script>${article}`;
+  assert.equal(extractClientRedirect("https://example.com/post", articleWithScript), null);
+});
+
 test("core: client-side meta refresh redirects are detected and followed", async () => {
   const HOP = "https://example.com/go?to=blog";
   const redirectHtml = `<html><head><meta http-equiv="refresh" content="0; url=https://example.com/blog/no-headless"></head><body>redirecting</body></html>`;
