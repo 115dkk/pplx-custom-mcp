@@ -1,0 +1,8 @@
+{
+  "items": [
+    { "owner": { "display_name": "Top User" }, "is_accepted": true, "score": 20, "creation_date": 1700000100, "answer_id": 201, "question_id": 100, "body": "<p>Accepted answer.</p>" },
+    { "owner": { "display_name": "Linked User" }, "is_accepted": false, "score": 5, "creation_date": 1700000200, "answer_id": 202, "question_id": 100, "body": "<p>Linked answer.</p>" }
+  ],
+  "has_more": false,
+  "quota_remaining": 298
+}

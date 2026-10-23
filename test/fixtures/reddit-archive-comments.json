@@ -1,0 +1,8 @@
+{
+  "data": [
+    { "kind": "t1", "data": { "author": "first", "body": "Archived comment", "created_utc": 1727274389, "score": 12, "replies": { "kind": "Listing", "data": { "children": [
+      { "kind": "t1", "data": { "author": "second", "body": "Nested archive reply", "created_utc": 1727274503, "score": 4, "replies": "" } }
+    ] } } } },
+    { "kind": "more", "data": { "children": ["missing"] } }
+  ]
+}

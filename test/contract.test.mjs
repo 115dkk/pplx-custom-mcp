@@ -71,11 +71,11 @@ test("contract: every registered site preset has an extractor, and vice versa", 
   // Guards refactor B's registry: a preset that resolveSitePreset can return
   // but SITE_EXTRACTORS does not know falls back to generic extraction, which
   // is the silent-degradation failure the registry exists to prevent.
-  const withExtractors = ["reddit", "namu", "mediawiki", "sage", "news", "dcinside"];
+  const withExtractors = ["reddit", "youtube", "namu", "mediawiki", "sage", "news", "dcinside"];
   for (const preset of withExtractors) {
     assert.equal(typeof lib.SITE_EXTRACTORS[preset]?.extract, "function", `${preset} has no registered extractor`);
     assert.ok(lib.SITE_EXTRACTORS[preset].source, `${preset} has no source label`);
   }
-  // steam/youtube/github route by preset but carry no text extractor by design.
+  // steam/github route by preset but carry no text extractor by design.
   assert.deepEqual(Object.keys(lib.SITE_EXTRACTORS).sort(), [...withExtractors].sort());
 });

@@ -1,0 +1,18 @@
+{
+  "items": [{
+    "tags": ["javascript", "html"],
+    "owner": { "display_name": "Question &amp; Author" },
+    "is_answered": true,
+    "view_count": 321,
+    "accepted_answer_id": 201,
+    "answer_count": 2,
+    "score": 42,
+    "creation_date": 1700000000,
+    "question_id": 100,
+    "link": "https://stackoverflow.com/questions/100/example",
+    "title": "How to use &lt;example&gt;?",
+    "body": "<p>Question <strong>body</strong>.</p>"
+  }],
+  "has_more": false,
+  "quota_remaining": 299
+}
