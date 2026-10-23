@@ -189,6 +189,21 @@ test("security: script and style blocks with spaced closing tags stay out of ext
   assert.doesNotMatch(text, /steal|secret/);
 });
 
+test("security: malformed HTML stripping stays linear", () => {
+  const cases = [
+    "<a ".repeat(40_000),
+    "<a ".repeat(20_000) + "\" ></a>",
+    "<!--".repeat(40_000),
+    '<a "'.repeat(40_000),
+  ];
+  for (const [index, html] of cases.entries()) {
+    const started = performance.now();
+    htmlToText(html);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 200, `case ${index + 1} took ${elapsed.toFixed(1)}ms`);
+  }
+});
+
 test("core: body text is extracted and interface noise is dropped", () => {
   const text = htmlToText(ARTICLE_HTML, "balanced", { include_links: true, base_url: URL_ARTICLE });
   assert.match(text, BODY_SENTENCE);
@@ -298,6 +313,11 @@ test("core: script redirects count only on near-empty interstitial pages", () =>
 
   const concatenated = `<script>function go(q) { window.location.href = '/search' + '/' + q; }</script>`;
   assert.equal(extractClientRedirect("https://blog.tistory.com/689", concatenated), null);
+  assert.equal(extractClientRedirect("https://example.com/", `<script>location.href = "/search"\n  + "/" + query;</script>`), null);
+  assert.equal(
+    extractClientRedirect("https://example.com/", `<script>location.href = "/landing"\nfoo();</script>`)?.url,
+    "https://example.com/landing"
+  );
 
   const articleWithScript = `<script>if (!ok) { location.href = "/login"; }</script>${article}`;
   assert.equal(extractClientRedirect("https://example.com/post", articleWithScript), null);

@@ -9,6 +9,7 @@ import {
   createServer,
   degradationCause,
   fetchPageWithFallbacks,
+  fetchRemoteBody,
   looksBlocked,
   makeApiRequest,
 } from "../src/index.js";
@@ -87,7 +88,40 @@ test("api: 429 is retried and can recover", async () => {
   }
 });
 
-test("api: persistent 429 stops after two retries", async () => {
+test("api: response body remains inside the request timeout", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (_input, init = {}) => {
+    let timer;
+    const stream = new ReadableStream({
+      start(controller) {
+        timer = setTimeout(() => {
+          controller.enqueue(new TextEncoder().encode('{"results":[]}'));
+          controller.close();
+        }, 500);
+        init.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          controller.error(new DOMException("aborted", "AbortError"));
+        }, { once: true });
+      },
+      cancel() {
+        clearTimeout(timer);
+      },
+    });
+    return new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const started = Date.now();
+  try {
+    await assert.rejects(
+      makeApiRequest("search", { query: "x" }, "pplx-test", 30),
+      /Perplexity API timeout \(30 ms\)\./
+    );
+    assert.ok(Date.now() - started < 250, "body timeout did not abort promptly");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test("api: persistent 429 stops after one retry", async () => {
   let calls = 0;
   const original = globalThis.fetch;
   globalThis.fetch = async () => {
@@ -100,9 +134,39 @@ test("api: persistent 429 stops after two retries", async () => {
       makeApiRequest("search", { query: "x" }, "pplx-test", 10_000),
       /Perplexity API error: 429 Too Many Requests/
     );
-    assert.equal(calls, 3);
+    assert.equal(calls, 2);
   } finally {
     __setSleepForTests();
+    globalThis.fetch = original;
+  }
+});
+
+test("budget: Agent timeout leaves one search fallback attempt", async () => {
+  const original = globalThis.fetch;
+  let searches = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.endsWith("/v1/agent")) {
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+      });
+    }
+    if (url.endsWith("/search")) {
+      searches++;
+      return new Response(JSON.stringify({ results: [] }), { headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unstubbed fetch: ${url}`);
+  };
+  try {
+    const deadline = {
+      end: Date.now() + 15_000,
+      remaining() { return Math.max(0, this.end - Date.now()); },
+      agent_limit_ms: 50,
+      agent_min_ms: 1,
+    };
+    await fetchRemoteBody("https://example.com/article", 4_000, "pplx-test", [], deadline);
+    assert.equal(searches, 1);
+  } finally {
     globalThis.fetch = original;
   }
 });
@@ -112,6 +176,48 @@ test("blocking status and timeout degradation priorities", () => {
   assert.equal(looksBlocked(430, "x"), true);
   assert.equal(degradationCause({ timedOut: true }), "timeout");
   assert.equal(degradationCause({ timedOut: true, blocked: true }), "blocked");
+});
+
+test("mcp: fetch_many limits Perplexity API concurrency to two", async () => {
+  const urls = Array.from({ length: 5 }, (_, i) => `https://example.com/blocked-${i + 1}`);
+  const original = globalThis.fetch;
+  let active = 0;
+  let maxActive = 0;
+  let apiCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.startsWith("https://api.perplexity.ai/")) {
+      apiCalls++;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active--;
+      if (url.endsWith("/v1/agent")) {
+        return new Response(JSON.stringify({ output: [{ type: "fetch_url_results", contents: [] }] }), {
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ results: [] }), { headers: { "content-type": "application/json" } });
+    }
+    if (url.startsWith("https://archive.org/wayback/available")) {
+      return new Response(JSON.stringify({ archived_snapshots: {} }), { headers: { "content-type": "application/json" } });
+    }
+    if (urls.includes(url)) return new Response("Access denied", { status: 403 });
+    throw new Error(`unstubbed fetch: ${url}`);
+  };
+  const { client, close } = await connect();
+  try {
+    const result = await client.callTool({
+      name: "perplexity_fetch_many",
+      arguments: { urls, use_cache: false },
+    });
+    assert.equal(result.structuredContent.items.length, 5);
+    assert.ok(apiCalls >= 10, `expected Agent and search calls, got ${apiCalls}`);
+    assert.ok(maxActive <= 2, `Perplexity concurrency reached ${maxActive}`);
+  } finally {
+    await close();
+    globalThis.fetch = original;
+  }
 });
 
 test("mcp: fetch_many runs concurrently and preserves input order", async () => {

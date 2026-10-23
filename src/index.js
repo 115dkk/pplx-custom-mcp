@@ -431,9 +431,7 @@ const HTML_ENTITIES = [
 ];
 
 /** @type {Array<[RegExp, string]>} */
-const BASE_STRUCTURAL_PATTERNS = [
-  [/<!--[\s\S]*?-->/g, ""],
-];
+const BASE_STRUCTURAL_PATTERNS = [];
 
 /** @type {Array<[RegExp, string]>} */
 const BALANCED_STRUCTURAL_PATTERNS = [
@@ -607,14 +605,57 @@ function markdownLink(label, url) {
   return safeUrl ? `[${safeLabel}](<${safeUrl}>)` : safeLabel;
 }
 
+// Index of the '>' that closes the tag opening at `start`, skipping any '>'
+// inside a quoted attribute value, or -1. One forward pass.
+function findTagOpenEnd(source, start) {
+  let quote = "";
+  for (let i = start + 1; i < source.length; i++) {
+    const char = source[i];
+    if (quote) {
+      if (char === quote) quote = "";
+    } else if (char === "\"" || char === "'") {
+      quote = char;
+    } else if (char === ">") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function anchorToMarkdown(rawAttrs, inner, includeLinks, baseUrl) {
+  const label = fragmentToText(inner);
+  if (!includeLinks) return ` ${label || inner} `;
+  const href = normalizeLinkHref(parseAttributes(rawAttrs).href, baseUrl);
+  if (!href) return ` ${label || inner} `;
+  return ` ${markdownLink(label || href, href)} `;
+}
+
+// Anchors are found by scanning forward rather than with a regular expression.
+// Attribute values may contain '>' (Brunch writes data-tiara-action-name="본문
+// 하단 > 키워드 클릭"), which cuts a [^>]* pattern short and leaks the rest of
+// the attribute into the link label, while a quote-aware pattern backtracks
+// quadratically on malformed markup.
 function htmlLinksToMarkdown(html, { include_links = false, base_url = "" } = {}) {
-  return String(html || "").replace(/<a\b((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/a>/gi, (all, rawAttrs, inner) => {
-    const label = fragmentToText(inner);
-    if (!include_links) return ` ${label || inner} `;
-    const href = normalizeLinkHref(parseAttributes(rawAttrs).href, base_url);
-    if (!href) return ` ${label || inner} `;
-    return ` ${markdownLink(label || href, href)} `;
-  });
+  const source = String(html || "");
+  const lower = source.toLowerCase();
+  const output = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = findHtmlTagStart(lower, "a", cursor);
+    if (start < 0) break;
+    const openEnd = findTagOpenEnd(source, start);
+    if (openEnd < 0) break;
+    const closeEnd = findHtmlTagEnd(lower, "a", openEnd + 1);
+    if (closeEnd < 0) break;
+    const closeStart = lower.lastIndexOf("</a", closeEnd);
+    output.push(
+      source.slice(cursor, start),
+      anchorToMarkdown(source.slice(start + 2, openEnd), source.slice(openEnd + 1, closeStart), include_links, base_url)
+    );
+    cursor = closeEnd;
+  }
+  output.push(source.slice(cursor));
+  return output.join("");
 }
 
 function stripMarkdownLinks(text) {
@@ -655,20 +696,71 @@ function extractLinksFromMarkdown(text, baseUrl = "", limit = 80) {
   return links;
 }
 
+function stripHtmlTagsQuoteAware(input) {
+  const source = String(input || "");
+  const output = [];
+  let textStart = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    if (source[i] !== "<") {
+      i++;
+      continue;
+    }
+
+    const after = source.slice(i + 1, i + 9).toLowerCase();
+    if (after.startsWith("!--")) {
+      output.push(source.slice(textStart, i), " ");
+      const end = source.indexOf("-->", i + 4);
+      if (end < 0) return output.join("");
+      i = end + 3;
+      textStart = i;
+      continue;
+    }
+    if (["https:", "http:", "mailto:", "tel:", "ftp:"].some((scheme) => after.startsWith(scheme))) {
+      i++;
+      continue;
+    }
+    if (!/[a-zA-Z!/?]/.test(source[i + 1] || "")) {
+      i++;
+      continue;
+    }
+
+    output.push(source.slice(textStart, i));
+    const tagStart = i;
+    i++;
+    let quote = "";
+    while (i < source.length) {
+      const char = source[i];
+      if (quote) {
+        if (char === quote) quote = "";
+      } else if (char === "\"" || char === "'") {
+        quote = char;
+      } else if (char === ">") {
+        output.push(" ");
+        i++;
+        textStart = i;
+        break;
+      }
+      i++;
+    }
+    if (i >= source.length && textStart <= tagStart) {
+      const remainder = source.slice(tagStart);
+      output.push(remainder.includes(">") ? remainder.replace(/<[^>]+>/g, " ") : remainder);
+      textStart = source.length;
+    }
+  }
+  output.push(source.slice(textStart));
+  return output.join("");
+}
+
 function htmlToText(html, mode = "balanced", opts = {}) {
   let out = stripRawTextElements(String(html || "").replace(/\r\n?/g, "\n"));
   for (const [re, rep] of structuralPatternsForMode(mode)) out = out.replace(re, rep);
   out = htmlLinksToMarkdown(out, opts);
   out = out.replace(/<br\s*\/?>/gi, "\n");
   out = out.replace(/<\/(p|div|li|h[1-6]|tr|article|section)>/gi, "\n");
-  // htmlLinksToMarkdown emits `[label](<url>)`; the angle brackets keep URLs
-  // containing spaces or parens valid in Markdown, but they also look like tags.
-  // Skip anything whose first token is a URL scheme so tag stripping does not
-  // swallow the href and leave `[label]( )` behind. Quoted alternatives start
-  // with quote characters while the fallback excludes both quotes, preventing
-  // ambiguous overlap and the catastrophic backtracking it can cause.
-  out = out.replace(/<!--[\s\S]*?-->/g, " ");
-  out = out.replace(/<(?!(?:https?|mailto|tel|ftp):)[a-zA-Z!\/?](?:"[^"]*"|'[^']*'|[^'">])*>/g, " ");
+  out = stripHtmlTagsQuoteAware(out);
   out = decodeEntities(out);
   return cleanText(out, mode);
 }
@@ -1643,7 +1735,28 @@ function safeResolveUrl(baseUrl, candidate) {
 const CLIENT_REDIRECT_PAGE_TEXT_LIMIT = 600;
 
 function roughVisibleTextLength(html) {
-  return stripRawTextElements(html).replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().length;
+  return stripHtmlTagsQuoteAware(stripRawTextElements(html)).replace(/\s+/g, " ").trim().length;
+}
+
+// Bodies of inline <script> elements, found with the same index-based tag
+// scanner as stripHtmlElementBlocks rather than a regular expression.
+function inlineScriptBodies(html) {
+  const source = String(html || "");
+  const lower = source.toLowerCase();
+  const bodies = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const start = findHtmlTagStart(lower, "script", cursor);
+    if (start < 0) break;
+    const openEnd = lower.indexOf(">", start + "<script".length);
+    if (openEnd < 0) break;
+    const closeEnd = findHtmlTagEnd(lower, "script", openEnd + 1);
+    if (closeEnd < 0) break;
+    const closeStart = lower.lastIndexOf("</script", closeEnd);
+    bodies.push(source.slice(openEnd + 1, closeStart));
+    cursor = closeEnd;
+  }
+  return bodies;
 }
 
 function extractClientRedirect(baseUrl, html) {
@@ -1665,12 +1778,12 @@ function extractClientRedirect(baseUrl, html) {
   // literal must be the entire right-hand side, and the page itself must be
   // close to empty, as interstitials are.
   const jsPatterns = [
-    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["'][ \t]*(?=[;}\r\n]|$)/i,
+    /(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["'][ \t]*(?=;|}|$|(?:\r\n?|\n)(?!\s*[+\-*\/%.,?:|&(\[]))/i,
     /(?:window\.)?location\.replace\(\s*["']([^"']+)["']\s*\)/i,
-    /document\.location\s*=\s*["']([^"']+)["'][ \t]*(?=[;}\r\n]|$)/i,
+    /document\.location\s*=\s*["']([^"']+)["'][ \t]*(?=;|}|$|(?:\r\n?|\n)(?!\s*[+\-*\/%.,?:|&(\[]))/i,
   ];
   const scan = html.slice(0, 40_000);
-  const scripts = [...scan.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)].map((m) => m[1]).join("\n");
+  const scripts = inlineScriptBodies(scan).join("\n");
   if (!scripts) return null;
   for (const re of jsPatterns) {
     const match = scripts.match(re);
@@ -2377,7 +2490,7 @@ function extractRedditPostData(url, body, opts = {}) {
 function redditPostIdFromUrl(url) {
   if (!isRedditUrl(url)) return "";
   try {
-    return (new URL(url).pathname.match(/\/comments\/([a-z0-9]+)(?:\/|$)/i)?.[1] || "").toLowerCase();
+    return (new URL(url).pathname.match(/^\/(?:(?:r|u|user)\/[^/]+\/)?comments\/([a-z0-9]+)(?:\/|$)/i)?.[1] || "").toLowerCase();
   } catch {
     return "";
   }
@@ -2412,7 +2525,7 @@ async function fetchRedditArchive(url, opts = {}, signal) {
   const [postsResult, commentsResult] = await Promise.allSettled([read(postsUrl), read(commentsUrl)]);
   if (postsResult.status !== "fulfilled") return null;
   const post = postsResult.value?.data?.[0];
-  if (!post) return null;
+  if (!post || String(post.id || "").toLowerCase() !== id) return null;
   const comments = commentsResult.status === "fulfilled" && Array.isArray(commentsResult.value?.data)
     ? commentsResult.value.data
     : [];
@@ -3582,6 +3695,32 @@ function createDeadline(ms) {
   return { end, remaining: () => Math.max(0, end - Date.now()) };
 }
 
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+  const startNext = () => {
+    while (active < max && queue.length) {
+      const { fn, resolve, reject } = queue.shift();
+      active++;
+      Promise.resolve()
+        .then(fn)
+        .then(resolve, reject)
+        .finally(() => {
+          active--;
+          startNext();
+        });
+    }
+  };
+  return {
+    run(fn) {
+      return new Promise((resolve, reject) => {
+        queue.push({ fn, resolve, reject });
+        startNext();
+      });
+    },
+  };
+}
+
 function recordDeadlineStage(deadline, stage, startedAt, ok, note) {
   if (!Array.isArray(deadline?.stages)) return;
   const entry = { stage, ms: Date.now() - startedAt, ok };
@@ -3671,7 +3810,7 @@ function hackerNewsCommentCount(children) {
 // HN separates paragraphs with a bare <p> and never closes it, so the generic
 // converter, which breaks lines on closing tags, would run them together.
 function hackerNewsHtmlToText(html, mode, linkOpts) {
-  return htmlToText(String(html || "").replace(/<p>/gi, "\n\n"), mode, linkOpts);
+  return htmlToText(String(html || "").split(/<p>/i).join("\n\n"), mode, linkOpts);
 }
 
 function extractHackerNewsItemData(url, json, opts = {}) {
@@ -3903,7 +4042,7 @@ async function trySiteApiFirst(url, opts, signal, warnings, debugInfo) {
       let questionId = seTarget.questionId;
       let linkedAnswer = null;
       if (seTarget.answerId) {
-        apiUrl = `https://api.stackexchange.com/2.3/answers/${seTarget.answerId}?site=${encodeURIComponent(seTarget.site)}`;
+        apiUrl = `https://api.stackexchange.com/2.3/answers/${seTarget.answerId}?site=${encodeURIComponent(seTarget.site)}&filter=withbody`;
         const linkedResponse = await fetchJsonApi(apiUrl, signal);
         linkedAnswer = linkedResponse?.json?.items?.[0] || null;
         questionId = linkedAnswer?.question_id;
@@ -4049,16 +4188,21 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings, deadline) {
     warnings.push(`나무위키 raw 직접 fetch 실패 후 동일 문서의 정규 /w/ URL로 원격 확인: ${readableUrl}`);
   }
 
+  const runLimited = (fn) => deadline?.limiter ? deadline.limiter.run(fn) : fn();
+
   // A two-URL fetch of the blocked Korean revision plus the working English
   // frontend exceeded our 20 s budget in production. Fetch only the exact
   // English revision; the query identity check makes this safe.
-  const agentLimit = remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS;
-  const agentTimeout = deadline ? Math.min(agentLimit, deadline.remaining() - 5_000) : agentLimit;
-  if (deadline && agentTimeout < 6_000) {
-    warnings.push("시간 예산 부족으로 Perplexity fetch_url 생략");
-    recordDeadlineStage(deadline, "agent-fetch-url", Date.now(), false, "skipped: budget");
-  } else {
+  const agentLimit = deadline?.agent_limit_ms
+    ?? (remoteUrls.length > 1 ? AGENT_HISTORICAL_FETCH_TIMEOUT_MS : AGENT_FETCH_TIMEOUT_MS);
+  const agentResult = await runLimited(async () => {
     const stageStart = Date.now();
+    const agentTimeout = deadline ? Math.min(agentLimit, deadline.remaining() - 8_000) : agentLimit;
+    if (deadline && agentTimeout < (deadline.agent_min_ms ?? 6_000)) {
+      warnings.push("시간 예산 부족으로 Perplexity fetch_url 생략");
+      recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, "skipped: budget");
+      return null;
+    }
     try {
       const agent = await fetchViaAgentUrlTool(agentUrl, maxChars, apiKey, agentTimeout);
       if (agent.text) {
@@ -4074,21 +4218,29 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings, deadline) {
       warnings.push(`Perplexity fetch_url 오류: ${String(err).slice(0, 160)}`);
       recordDeadlineStage(deadline, "agent-fetch-url", stageStart, false, err?.name === "AbortError" ? "timeout" : String(err).slice(0, 80));
     }
-  }
+    return null;
+  });
+  if (agentResult) return agentResult;
 
   // Always reached, whatever happened above.
-  const searchStart = Date.now();
-  if (deadline && Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000) < 4_000) {
-    warnings.push("시간 예산 부족으로 Perplexity 검색 폴백 생략");
-    recordDeadlineStage(deadline, "perplexity-search", searchStart, false, "skipped: budget");
-  } else try {
-    const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey, deadline);
-    recordDeadlineStage(deadline, "perplexity-search", searchStart, !!searched, searched ? undefined : "no matching result");
-    if (searched) return { text: searched, source: "perplexity" };
-  } catch (err) {
-    warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
-    recordDeadlineStage(deadline, "perplexity-search", searchStart, false, String(err).slice(0, 80));
-  }
+  const searchResult = await runLimited(async () => {
+    const searchStart = Date.now();
+    if (deadline && Math.min(SEARCH_FALLBACK_TIMEOUT_MS, deadline.remaining() - 4_000) < 4_000) {
+      warnings.push("시간 예산 부족으로 Perplexity 검색 폴백 생략");
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, false, "skipped: budget");
+      return null;
+    }
+    try {
+      const searched = await fetchViaPerplexity(readableUrl, maxChars, apiKey, deadline);
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, !!searched, searched ? undefined : "no matching result");
+      return searched ? { text: searched, source: "perplexity" } : null;
+    } catch (err) {
+      warnings.push(`Perplexity 검색 폴백 실패: ${String(err).slice(0, 160)}`);
+      recordDeadlineStage(deadline, "perplexity-search", searchStart, false, String(err).slice(0, 80));
+      return null;
+    }
+  });
+  if (searchResult) return searchResult;
   return null;
 }
 
@@ -4367,6 +4519,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
   if (cached) return cached;
 
   const deadline = createDeadline(opts.deadline_ms ?? FETCH_DEADLINE_MS);
+  deadline.limiter = opts.remote_limiter;
+  deadline.agent_limit_ms = opts.agent_timeout_ms;
+  deadline.agent_min_ms = opts.agent_min_timeout_ms;
   const overallController = new AbortController();
   const overallTimer = setTimeout(
     () => overallController.abort(),
@@ -4895,7 +5050,10 @@ async function fetchViaPerplexity(url, maxChars, apiKey, deadline) {
         ].filter(Boolean);
         return parts.join("\n").slice(0, maxChars);
       }
-    } catch { /* try next candidate */ }
+    } catch (err) {
+      if (err?.status === 429) break;
+      // Try the next candidate for non-rate-limit failures.
+    }
   }
   return null;
 }
@@ -4943,6 +5101,7 @@ async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIM
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remaining);
     let res;
+    let responseText;
     try {
       res = await fetch(`https://api.perplexity.ai/${endpoint}`, {
         method: "POST",
@@ -4954,6 +5113,7 @@ async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIM
         body: JSON.stringify(body),
         signal: controller.signal,
       });
+      responseText = await res.text();
     } catch (err) {
       if (err && err.name === "AbortError") {
         throw new Error(`Perplexity API timeout (${timeoutMs} ms).`);
@@ -4963,12 +5123,19 @@ async function makeApiRequest(endpoint, body, apiKey, timeoutMs = PERPLEXITY_TIM
       clearTimeout(timer);
     }
 
-    if (res.ok) return res;
+    if (res.ok) {
+      return new Response(responseText, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
+    }
 
-    let errorText;
-    try { errorText = await res.text(); } catch { errorText = "Unable to parse error response"; }
-    const error = new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${errorText}`);
-    if (res.status !== 429 || retries >= 2) throw error;
+    const error = Object.assign(
+      new Error(`Perplexity API error: ${res.status} ${res.statusText}\n${responseText}`),
+      { status: res.status }
+    );
+    if (res.status !== 429 || retries >= 1) throw error;
     last429Error = error;
 
     const retryAfterHeader = res.headers.get("retry-after");
@@ -5692,11 +5859,13 @@ function createServer(apiKey) {
     },
     async (args) => {
       const toolStart = Date.now();
+      const remoteLimiter = createLimiter(2);
       const entries = await Promise.all(args.urls.map(async (url, i) => {
         try {
           const opts = normalizeFetchOpts(args, {
             max_chars: args.max_chars ?? 4000,
             tool_started_at: toolStart,
+            remote_limiter: remoteLimiter,
           });
           const { result, text } = await fetchAndFormat(url, apiKey, opts);
           return {
@@ -5741,6 +5910,7 @@ function createServer(apiKey) {
       if (validationError) return toolError(validationError);
 
       const search = await runSearch(opts, apiKey);
+      const remoteLimiter = createLimiter(2);
       const topK = Math.min(args.fetch_top_k ?? 3, SEARCH_FETCH_TOP_K_LIMIT, search.results.length);
       const chunks = [
         "# Search preview",
@@ -5769,7 +5939,7 @@ function createServer(apiKey) {
             include_links: args.include_links,
             debug: args.debug,
             use_cache: args.use_cache,
-          }, { deadline_ms: fetchDeadline, tool_started_at: toolStart });
+          }, { deadline_ms: fetchDeadline, tool_started_at: toolStart, remote_limiter: remoteLimiter });
           const fetched = await fetchAndFormat(result.url, apiKey, fetchOpts);
           return {
             chunk: `\n## [${i + 1}] ${cleanText(result.title || result.url, "strict")}\nSearch URL: ${result.url}\n${fetched.text}`,
@@ -5819,6 +5989,7 @@ export {
   cleanMarkdownText,
   normalizeCleaningMode,
   htmlToText,
+  stripHtmlTagsQuoteAware,
   htmlLinksToMarkdown,
   extractLinksFromMarkdown,
   extractMetadata,
@@ -5895,6 +6066,7 @@ export {
   looksBlocked,
   looksSteamAgeGate,
   createDeadline,
+  createLimiter,
   degradationCause,
   buildSimpleChallengeSubmission,
   buildSteamAgeSubmission,

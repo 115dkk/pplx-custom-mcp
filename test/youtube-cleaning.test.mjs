@@ -62,3 +62,18 @@ test("Chromium client hints follow GREASE ordering", () => {
   assert.equal(chromeSecChUa(124), '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"');
   assert.equal(chromeSecChUa(157), '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"');
 });
+
+test("cleaning: anchor attributes containing '>' stay out of the link label", () => {
+  // Brunch: data-tiara-action-name="본문 하단 > 키워드 클릭" on keyword links.
+  const html = `<p>keyword <a href="/keyword/x" data-tiara-action-name="본문 하단 > 키워드 클릭" data-tiara-layer="bottom">브런치</a></p>`;
+  const out = htmlToText(html, "balanced", { include_links: true, base_url: "https://brunch.co.kr/" });
+  assert.match(out, /\[브런치\]\(<https:\/\/brunch\.co\.kr\/keyword\/x>\)/);
+  assert.doesNotMatch(out, /data-tiara|키워드 클릭/);
+});
+
+test("cleaning: anchor conversion stays linear on unclosed anchors", () => {
+  const started = performance.now();
+  htmlToText("<a href=x>".repeat(100000), "balanced", { include_links: true });
+  htmlToText("<a \"".repeat(100000), "balanced", { include_links: true });
+  assert.ok(performance.now() - started < 1000, "anchor scanning must not go quadratic");
+});

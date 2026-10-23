@@ -85,10 +85,11 @@ test("trySiteApiFirst is disabled by explicit preset and warns on failure", asyn
 
 test("trySiteApiFirst fetches HN and marks a linked Stack Exchange answer first", async () => {
   const question = fixture("stackexchange-question.json");
-  const answers = fixture("stackexchange-answers.json");
+  const answerFixture = fixtureJson("stackexchange-answers.json");
+  const answers = JSON.stringify({ ...answerFixture, items: answerFixture.items.filter((answer) => answer.answer_id !== 202) });
   const stub = installFetch([
     jsonRoute("https://hn.algolia.com/api/v1/items/9007", fixture("hn-item.json")),
-    jsonRoute("https://api.stackexchange.com/2.3/answers/202?site=stackoverflow.com", JSON.stringify({ items: [{ answer_id: 202, question_id: 100, owner: { display_name: "Linked User" }, score: 5, creation_date: 1700000200, body: "<p>Linked answer.</p>" }] })),
+    jsonRoute("https://api.stackexchange.com/2.3/answers/202?site=stackoverflow.com&filter=withbody", JSON.stringify({ items: [{ answer_id: 202, question_id: 100, owner: { display_name: "Linked User" }, score: 5, creation_date: 1700000200, body: "<p>Linked answer outside the top ten.</p>" }] })),
     jsonRoute("https://api.stackexchange.com/2.3/questions/100?", question),
     jsonRoute("https://api.stackexchange.com/2.3/questions/100/answers?", answers),
   ]);
@@ -101,6 +102,7 @@ test("trySiteApiFirst fetches HN and marks a linked Stack Exchange answer first"
     const se = await trySiteApiFirst("https://stackoverflow.com/a/202", { site_preset: "auto" }, undefined, [], { attempts: [] });
     assert.equal(se.source, "stackexchange-api");
     assert.match(se.text, /\[A1\] \(linked\) score 5/);
+    assert.match(se.text, /Linked answer outside the top ten\./);
   } finally {
     stub.restore();
   }
@@ -110,6 +112,8 @@ test("Reddit archive helpers build a listing consumed by the existing extractor"
   const post = fixtureJson("reddit-archive-post.json").data[0];
   const comments = fixtureJson("reddit-archive-comments.json").data;
   assert.equal(redditPostIdFromUrl(REDDIT_URL), "1fp5gut");
+  assert.equal(redditPostIdFromUrl("https://www.reddit.com/r/comments/comments/abc123/title/"), "abc123");
+  assert.equal(redditPostIdFromUrl("https://www.reddit.com/prefix/comments/wrong/path"), "");
   assert.equal(redditPostIdFromUrl("https://www.reddit.com/r/testing/"), "");
   const page = extractRedditPostData(REDDIT_URL, JSON.stringify(buildRedditArchiveListing(post, comments)), {});
   assert.match(page.text, /^# Archive fixture post/);
@@ -135,6 +139,18 @@ test("fetchRedditArchive tolerates comment failure, but requires a post", async 
 
   stub = installFetch([
     jsonRoute(postsUrl, JSON.stringify({ data: [] })),
+    jsonRoute(commentsUrl, fixture("reddit-archive-comments.json")),
+  ]);
+  try {
+    assert.equal(await fetchRedditArchive(REDDIT_URL, {}), null);
+  } finally {
+    stub.restore();
+  }
+
+  const wrongPost = fixtureJson("reddit-archive-post.json");
+  wrongPost.data[0].id = "different";
+  stub = installFetch([
+    jsonRoute(postsUrl, JSON.stringify(wrongPost)),
     jsonRoute(commentsUrl, fixture("reddit-archive-comments.json")),
   ]);
   try {
