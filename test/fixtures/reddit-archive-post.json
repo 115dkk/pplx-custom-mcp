@@ -1,0 +1,19 @@
+{
+  "data": [{
+    "_meta": { "retrieved_2nd_on": 1727408112 },
+    "author": "archivist",
+    "created_utc": 1727273640,
+    "id": "1fp5gut",
+    "is_self": true,
+    "name": "t3_1fp5gut",
+    "num_comments": 2,
+    "permalink": "/r/testing/comments/1fp5gut/archive_fixture/",
+    "score": 426,
+    "selftext": "Archived post body",
+    "subreddit": "testing",
+    "subreddit_name_prefixed": "r/testing",
+    "title": "Archive fixture post",
+    "upvote_ratio": 0.98,
+    "url": "https://www.reddit.com/r/testing/comments/1fp5gut/archive_fixture/"
+  }]
+}

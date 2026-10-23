@@ -4,6 +4,9 @@ import { z } from "zod";
 // ── Config ──────────────────────────────────────────────────────────
 
 const VERSION = "1.3.0";
+const CHROME_MAJOR = 157;
+const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
+const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
 const PERPLEXITY_TIMEOUT_MS = 30_000;
 const FETCH_PER_ATTEMPT_MS = 8_000;
@@ -32,9 +35,9 @@ const USER_AGENTS = [
   // Googlebot first: many SPA sites pre-render for SEO.
   "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
   // Desktop Chrome.
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  DESKTOP_CHROME_UA,
   // iOS Safari (mobile-light variants of paywalled/heavy sites).
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  IOS_SAFARI_UA,
 ];
 
 // Perplexity documents this as its user-requested fetch identity. Unlike the
@@ -48,13 +51,13 @@ const NAMU_USER_AGENTS = [
 const DCINSIDE_USER_AGENTS = [
   "dcinside.app",
   "dcinside.app",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  DESKTOP_CHROME_UA,
+  IOS_SAFARI_UA,
 ];
 
 const REDDIT_USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  DESKTOP_CHROME_UA,
+  IOS_SAFARI_UA,
   `perplexity-mcp/${VERSION} public Reddit JSON fallback`,
 ];
 
@@ -454,6 +457,7 @@ const STRICT_STRUCTURAL_PATTERNS = [
 ];
 
 // Sentence-bounded so a single literal "cookie" mention in body doesn't nuke a paragraph.
+/** @type {Array<[RegExp, string]>} */
 const JUNK_PATTERNS = [
   [/(we use cookies|cookie policy|accept (all )?cookies|쿠키 (사용|정책|동의))[^.\n]{0,200}\.?/gi, ""],
   [/(subscribe to (our )?newsletter|sign up for[^.\n]{0,80}newsletter|뉴스레터 (구독|신청))[^.\n]{0,200}\.?/gi, ""],
@@ -554,7 +558,7 @@ function structuralPatternsForMode(mode) {
 
 function cleanText(s, mode = "balanced") {
   if (!s) return "";
-  let out = s;
+  let out = String(s).replace(/\r\n?/g, "\n");
   const normalized = normalizeCleaningMode(mode);
   if (normalized !== "raw-ish") {
     for (const [re, rep] of JUNK_PATTERNS) out = out.replace(re, rep);
@@ -602,7 +606,7 @@ function markdownLink(label, url) {
 }
 
 function htmlLinksToMarkdown(html, { include_links = false, base_url = "" } = {}) {
-  return String(html || "").replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (all, rawAttrs, inner) => {
+  return String(html || "").replace(/<a\b((?:"[^"]*"|'[^']*'|[^'">])*)>([\s\S]*?)<\/a>/gi, (all, rawAttrs, inner) => {
     const label = fragmentToText(inner);
     if (!include_links) return ` ${label || inner} `;
     const href = normalizeLinkHref(parseAttributes(rawAttrs).href, base_url);
@@ -650,7 +654,7 @@ function extractLinksFromMarkdown(text, baseUrl = "", limit = 80) {
 }
 
 function htmlToText(html, mode = "balanced", opts = {}) {
-  let out = stripRawTextElements(html);
+  let out = stripRawTextElements(String(html || "").replace(/\r\n?/g, "\n"));
   for (const [re, rep] of structuralPatternsForMode(mode)) out = out.replace(re, rep);
   out = htmlLinksToMarkdown(out, opts);
   out = out.replace(/<br\s*\/?>/gi, "\n");
@@ -658,8 +662,11 @@ function htmlToText(html, mode = "balanced", opts = {}) {
   // htmlLinksToMarkdown emits `[label](<url>)`; the angle brackets keep URLs
   // containing spaces or parens valid in Markdown, but they also look like tags.
   // Skip anything whose first token is a URL scheme so tag stripping does not
-  // swallow the href and leave `[label]( )` behind.
-  out = out.replace(/<(?!(?:https?|mailto|tel|ftp):)[^>]+>/g, " ");
+  // swallow the href and leave `[label]( )` behind. Quoted alternatives start
+  // with quote characters while the fallback excludes both quotes, preventing
+  // ambiguous overlap and the catastrophic backtracking it can cause.
+  out = out.replace(/<!--[\s\S]*?-->/g, " ");
+  out = out.replace(/<(?!(?:https?|mailto|tel|ftp):)[a-zA-Z!\/?](?:"[^"]*"|'[^']*'|[^'">])*>/g, " ");
   out = decodeEntities(out);
   return cleanText(out, mode);
 }
@@ -854,8 +861,23 @@ const SEC_FETCH_BY_KIND = {
   },
 };
 
+function chromeSecChUa(major) {
+  const chars = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
+  const versions = ["8", "99", "24"];
+  const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+  const grease = [`Not${chars[major % 11]}A${chars[(major + 1) % 11]}Brand`, versions[major % 3]];
+  const chromium = ["Chromium", String(major)];
+  const chrome = ["Google Chrome", String(major)];
+  const order = orders[major % 6];
+  const list = Array(3);
+  list[order[0]] = grease;
+  list[order[1]] = chromium;
+  list[order[2]] = chrome;
+  return list.map(([brand, version]) => `"${brand}";v="${version}"`).join(", ");
+}
+
 const CHROME_CLIENT_HINTS = {
-  "sec-ch-ua": '"Chromium";v="120", "Google Chrome";v="120", "Not-A.Brand";v="99"',
+  "sec-ch-ua": chromeSecChUa(CHROME_MAJOR),
   "sec-ch-ua-mobile": "?0",
   "sec-ch-ua-platform": '"Windows"',
 };
@@ -1908,8 +1930,7 @@ function extractDcinsideArticleData(url, html, mode = "balanced", opts = {}) {
 // DCinside renders the article body server-side but loads the comment
 // thread via a separate XHR POST to /board/comment/. A plain fetch never
 // runs that JS, so comments are missing. We replicate the XHR directly.
-const DCINSIDE_DESKTOP_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const DCINSIDE_DESKTOP_UA = DESKTOP_CHROME_UA;
 const DCINSIDE_COMMENT_ENDPOINT = "https://gall.dcinside.com/board/comment/";
 const DCINSIDE_COMMENT_MAX_PAGES = 8;
 const DCINSIDE_COMMENT_MAX_ITEMS = 400;
@@ -2328,6 +2349,200 @@ function extractRedditPostData(url, body, opts = {}) {
       link_url: linkUrl || undefined,
       is_self: !!post.is_self,
       comments: comments.length ? comments : undefined,
+    }),
+  };
+}
+
+function redditPostIdFromUrl(url) {
+  if (!isRedditUrl(url)) return "";
+  try {
+    return (new URL(url).pathname.match(/\/comments\/([a-z0-9]+)(?:\/|$)/i)?.[1] || "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function buildRedditArchiveListing(post, commentsTree) {
+  return [
+    { kind: "Listing", data: { children: [{ kind: "t3", data: post }] } },
+    { kind: "Listing", data: { children: Array.isArray(commentsTree) ? commentsTree : [] } },
+  ];
+}
+
+function archiveTimestampIso(value) {
+  if (value === "" || value === null || value === undefined) return "";
+  const number = Number(value);
+  if (Number.isFinite(number)) return new Date(number > 1e12 ? number : number * 1000).toISOString();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+async function fetchRedditArchive(url, opts = {}, signal) {
+  const id = redditPostIdFromUrl(url);
+  if (!id) return null;
+  const postsUrl = `https://arctic-shift.photon-reddit.com/api/posts/ids?ids=${encodeURIComponent(id)}`;
+  const commentsUrl = `https://arctic-shift.photon-reddit.com/api/comments/tree?link_id=${encodeURIComponent(id)}&limit=200`;
+  const headers = { Accept: "application/json", "User-Agent": DESKTOP_CHROME_UA };
+  const read = async (target) => {
+    const response = await fetch(target, { headers, signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  };
+  const [postsResult, commentsResult] = await Promise.allSettled([read(postsUrl), read(commentsUrl)]);
+  if (postsResult.status !== "fulfilled") return null;
+  const post = postsResult.value?.data?.[0];
+  if (!post) return null;
+  const comments = commentsResult.status === "fulfilled" && Array.isArray(commentsResult.value?.data)
+    ? commentsResult.value.data
+    : [];
+  const listing = buildRedditArchiveListing(post, comments);
+  const page = extractRedditPostData(url, JSON.stringify(listing), opts);
+  if (!page) return null;
+  const archivedAt = archiveTimestampIso(post._meta?.retrieved_2nd_on ?? post.retrieved_on);
+  return { ...page, archivedAt, apiUrl: postsUrl };
+}
+
+async function tryRedditArchive(url, opts, warnings, attemptTotal, deadline) {
+  if (opts.site_preset !== "reddit") return null;
+  const remaining = deadline ? Number(deadline.remaining()) : 10_000;
+  if (!Number.isFinite(remaining) || remaining < 3_000) return null;
+  const timeout = Math.min(10_000, remaining);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const onAbort = () => controller.abort();
+  opts.signal?.addEventListener?.("abort", onAbort, { once: true });
+  try {
+    const page = await fetchRedditArchive(url, opts, controller.signal);
+    if (!page) return null;
+    warnings.push(`Reddit 직접 fetch가 차단되어 Arctic Shift 아카이브로 대체: ${page.apiUrl} — 점수와 댓글은 수집 시점 기준입니다.`);
+    return {
+      ok: true,
+      partial: true,
+      source: "reddit-archive",
+      text: `[Reddit이 Worker 접근을 차단해 Arctic Shift 아카이브로 대체 (점수·댓글은 수집 시점 기준, 무료)]\n\n${page.text}`,
+      attempt: attemptTotal + 1,
+      warnings,
+      meta: page.meta,
+      structured: { ...page.structured, archived_source: "arctic-shift", archived_at: page.archivedAt || undefined },
+      finalUrl: url,
+      status: 200,
+    };
+  } catch (err) {
+    warnings.push(`Arctic Shift 아카이브 fetch 실패: ${err?.name === "AbortError" ? "timeout" : String(err).slice(0, 160)}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener?.("abort", onAbort);
+  }
+}
+
+function extractBalancedJson(text, startIndex) {
+  const source = String(text || "");
+  if (source[startIndex] !== "{") return null;
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = startIndex; index < source.length; index++) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(source.slice(startIndex, index + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function youtubeVideoId(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "youtu.be") return parsed.pathname.split("/").filter(Boolean)[0] || "";
+    if (!(host === "youtube.com" || host === "m.youtube.com")) return "";
+    if (parsed.pathname === "/watch") return parsed.searchParams.get("v") || "";
+    return parsed.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || "";
+  } catch {
+    return "";
+  }
+}
+
+function formatVideoDuration(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = Math.floor(total % 60);
+  return hours
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function extractYouTubeVideoData(url, html, mode = "balanced", opts = {}) {
+  const urlVideoId = youtubeVideoId(url);
+  if (!urlVideoId) return null;
+  const match = /ytInitialPlayerResponse\s*=\s*\{/.exec(String(html || ""));
+  if (!match) return null;
+  const startIndex = match.index + match[0].lastIndexOf("{");
+  const player = extractBalancedJson(html, startIndex);
+  const details = player?.videoDetails;
+  if (!details) return null;
+  const microformat = player?.microformat?.playerMicroformatRenderer || {};
+  const videoId = details.videoId || urlVideoId;
+  const title = cleanText(details.title || "", mode);
+  const description = cleanText(details.shortDescription || "", mode);
+  const published = microformat.publishDate || microformat.uploadDate || "";
+  const keywords = Array.isArray(details.keywords) ? details.keywords : [];
+  const lengthSeconds = Number(details.lengthSeconds);
+  const facts = [
+    details.author ? `Channel: ${details.author}` : "",
+    published ? `Published: ${published}` : "",
+    Number.isFinite(lengthSeconds) ? `Length: ${formatVideoDuration(lengthSeconds)}` : "",
+    details.viewCount != null ? `Views: ${details.viewCount}` : "",
+    microformat.category ? `Category: ${microformat.category}` : "",
+  ].filter(Boolean).join(" | ");
+  const text = [
+    title ? `# ${title}` : "",
+    facts,
+    keywords.length ? `Keywords: ${keywords.slice(0, 15).join(", ")}` : "",
+    description,
+  ].filter(Boolean).join("\n\n");
+  return {
+    text,
+    meta: compactObject({
+      title,
+      description: description.slice(0, 500),
+      canonical: `https://www.youtube.com/watch?v=${videoId}`,
+      author: details.author,
+      published,
+      siteName: "YouTube",
+      type: "video",
+    }),
+    structured: compactObject({
+      type: "youtube_video",
+      video_id: videoId,
+      title,
+      channel: details.author,
+      channel_id: details.channelId,
+      published,
+      length_seconds: Number.isFinite(lengthSeconds) ? lengthSeconds : undefined,
+      view_count: Number.isFinite(Number(details.viewCount)) ? Number(details.viewCount) : undefined,
+      category: microformat.category,
+      keywords: keywords.length ? keywords : undefined,
     }),
   };
 }
@@ -3184,6 +3399,10 @@ const SITE_EXTRACTORS = {
     source: "reddit-json",
     extract: (url, body, mode, opts) => extractRedditPostData(url, body, opts),
   },
+  youtube: {
+    source: "direct",
+    extract: (url, body, mode, opts) => extractYouTubeVideoData(url, body, mode, opts),
+  },
   namu: {
     source: "direct",
     extract: (url, body, mode, opts) => extractNamuWikiData(url, body, mode, opts),
@@ -3372,6 +3591,322 @@ function failureText(flags, status) {
       return `[경고: 봇 차단 감지(HTTP ${status}) + Perplexity 폴백 실패, 본문 추출 실패]`;
     default:
       return `[경고: 응답 본문 부족(HTTP ${status}) + Perplexity 폴백 실패]`;
+  }
+}
+
+function isHackerNewsUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase() === "news.ycombinator.com";
+  } catch {
+    return false;
+  }
+}
+
+function hackerNewsApiTarget(url) {
+  if (!isHackerNewsUrl(url)) return null;
+  const parsed = new URL(url);
+  const item = parsed.pathname === "/item" ? parsed.searchParams.get("id") : "";
+  if (/^\d+$/.test(item || "")) {
+    return { kind: "item", apiUrl: `https://hn.algolia.com/api/v1/items/${item}` };
+  }
+  const page = parsed.searchParams.get("p");
+  if ((parsed.pathname === "/" || parsed.pathname === "/news") && (!page || page === "1")) {
+    return { kind: "front_page", apiUrl: "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=30" };
+  }
+  return null;
+}
+
+function hackerNewsCommentCount(children) {
+  let count = 0;
+  for (const child of Array.isArray(children) ? children : []) {
+    count += 1 + hackerNewsCommentCount(child?.children);
+  }
+  return count;
+}
+
+function extractHackerNewsItemData(url, json, opts = {}) {
+  if (!isHackerNewsUrl(url) || !json || !json.id) return null;
+  const mode = opts.cleaning_mode || "balanced";
+  const linkOpts = { include_links: opts.include_links !== false, base_url: url };
+  const title = cleanText(json.title || (json.author ? `Comment by ${json.author}` : "Hacker News item"), mode);
+  const body = htmlToText(json.text || "", mode, linkOpts);
+  const numComments = hackerNewsCommentCount(json.children);
+  const comments = [];
+
+  const visit = (children, depth) => {
+    if (depth > 10 || comments.length >= 200) return;
+    for (const child of Array.isArray(children) ? children : []) {
+      if (comments.length >= 200) break;
+      const commentBody = htmlToText(child?.text || "", mode, linkOpts);
+      if (child?.author != null || child?.text != null) {
+        comments.push({
+          author: child?.author || "deleted",
+          created: child?.created_at || "",
+          depth,
+          text: commentBody,
+        });
+      }
+      visit(child?.children, depth + 1);
+    }
+  };
+  visit(json.children, 0);
+
+  const facts = [
+    "Site: Hacker News",
+    `Type: ${json.type || "story"}`,
+    json.author ? `Author: ${json.author}` : "",
+    Number.isFinite(Number(json.points)) ? `Points: ${Number(json.points)}` : "",
+    `Comments: ${numComments}`,
+    json.created_at ? `Published: ${json.created_at}` : "",
+  ].filter(Boolean).join(" | ");
+  const commentLines = comments.map((comment, index) => {
+    const indent = "  ".repeat(comment.depth);
+    const date = comment.created ? String(comment.created).slice(0, 10) : "unknown date";
+    const text = comment.text.replace(/\n/g, `\n${indent}`);
+    return `${indent}[C${index + 1}] ${comment.author} (${date}): ${text}`;
+  });
+  const canonical = `https://news.ycombinator.com/item?id=${json.id}`;
+  const storyId = json.story_id;
+  const text = [
+    `# ${title}`,
+    facts,
+    json.url ? `Link: ${json.url}` : "",
+    json.type === "comment" && storyId && Number(storyId) !== Number(json.id)
+      ? `Story: https://news.ycombinator.com/item?id=${storyId}`
+      : "",
+    body,
+    commentLines.length ? `Top comments:\n\n${commentLines.join("\n\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  return {
+    text,
+    meta: compactObject({
+      title,
+      description: body.slice(0, 500),
+      canonical,
+      author: json.author,
+      published: json.created_at,
+      siteName: "Hacker News",
+      type: "hn_item",
+    }),
+    structured: compactObject({
+      type: "hn_item",
+      id: json.id,
+      item_type: json.type,
+      title,
+      author: json.author,
+      points: Number.isFinite(Number(json.points)) ? Number(json.points) : undefined,
+      published: json.created_at,
+      url: json.url,
+      story_id: storyId,
+      parent_id: json.parent_id,
+      num_comments: numComments,
+      comments: comments.slice(0, 50).map((comment) => compactObject(comment)),
+    }),
+  };
+}
+
+function extractHackerNewsFrontPageData(url, json, opts = {}) {
+  if (!isHackerNewsUrl(url) || !Array.isArray(json?.hits)) return null;
+  const includeLinks = opts.include_links !== false;
+  const items = json.hits.map((hit) => compactObject({
+    id: hit.objectID || hit.story_id,
+    title: decodeEntities(hit.title || ""),
+    url: hit.url,
+    points: Number.isFinite(Number(hit.points)) ? Number(hit.points) : undefined,
+    author: hit.author,
+    num_comments: Number.isFinite(Number(hit.num_comments)) ? Number(hit.num_comments) : undefined,
+  })).filter((item) => item.id && item.title);
+  const lines = items.map((item, index) => {
+    const title = includeLinks && item.url ? markdownLink(item.title, item.url) : item.title;
+    const details = `${item.points ?? 0} points by ${item.author || "unknown"}, ${item.num_comments ?? 0} comments`;
+    const discussion = includeLinks ? ` — https://news.ycombinator.com/item?id=${item.id}` : "";
+    return `${index + 1}. ${title} — ${details}${discussion}`;
+  });
+  return {
+    text: [`# Hacker News front page`, ...lines].join("\n"),
+    meta: compactObject({ title: "Hacker News front page", canonical: "https://news.ycombinator.com/", siteName: "Hacker News", type: "hn_front_page" }),
+    structured: { type: "hn_front_page", items },
+  };
+}
+
+function stackExchangeQuestionTarget(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+    const fixed = new Set(["stackoverflow.com", "superuser.com", "serverfault.com", "askubuntu.com", "mathoverflow.net", "stackapps.com"]);
+    const allowed = fixed.has(host) || host.endsWith(".stackoverflow.com") || host.endsWith(".stackexchange.com");
+    if (!allowed) return null;
+    let match = parsed.pathname.match(/^\/(?:questions|q)\/(\d+)(?:\/|$)/);
+    if (match) return { site: host, questionId: match[1] };
+    match = parsed.pathname.match(/^\/a\/(\d+)(?:\/|$)/);
+    return match ? { site: host, answerId: match[1] } : null;
+  } catch {
+    return null;
+  }
+}
+
+function unixSecondsIso(value) {
+  return Number.isFinite(Number(value)) ? new Date(Number(value) * 1000).toISOString() : "";
+}
+
+function extractStackExchangeQuestionData(url, questionJson, answersJson, opts = {}) {
+  const target = stackExchangeQuestionTarget(url);
+  const question = questionJson?.items?.[0];
+  if (!target || !question || questionJson.error_id || answersJson?.error_id) return null;
+  const mode = opts.cleaning_mode || "balanced";
+  const linkOpts = { include_links: opts.include_links !== false, base_url: question.link || url };
+  const title = cleanText(decodeEntities(question.title || ""), mode);
+  const body = htmlToText(question.body || "", mode, linkOpts);
+  const siteName = target.site === "stackoverflow.com" ? "Stack Overflow" : target.site;
+  const published = unixSecondsIso(question.creation_date);
+  const answers = Array.isArray(answersJson?.items) ? answersJson.items : [];
+  const answerBlocks = answers.map((answer, index) => {
+    const author = decodeEntities(answer.owner?.display_name || "unknown");
+    const created = unixSecondsIso(answer.creation_date);
+    const labels = [answer.is_accepted ? "accepted" : "", answer._linked ? "linked" : ""].filter(Boolean).map((label) => `(${label})`).join(" ");
+    const header = `[A${index + 1}]${labels ? ` ${labels}` : ""} score ${Number(answer.score) || 0} · ${author} (${created.slice(0, 10) || "unknown date"}):`;
+    return `${header}\n${htmlToText(answer.body || "", mode, linkOpts)}`;
+  });
+  const facts = [
+    `Site: ${siteName}`,
+    `Score: ${Number(question.score) || 0}`,
+    `Answers: ${Number(question.answer_count) || 0}`,
+    `Views: ${Number(question.view_count) || 0}`,
+    Array.isArray(question.tags) && question.tags.length ? `Tags: ${question.tags.join(", ")}` : "",
+    published ? `Asked: ${published}` : "",
+    question.owner?.display_name ? `Author: ${decodeEntities(question.owner.display_name)}` : "",
+  ].filter(Boolean).join(" | ");
+  const author = decodeEntities(question.owner?.display_name || "");
+
+  return {
+    text: [`# ${title}`, facts, body, answerBlocks.length ? `Answers (sorted by votes):\n\n${answerBlocks.join("\n\n")}` : ""].filter(Boolean).join("\n\n"),
+    meta: compactObject({ title, description: body.slice(0, 500), canonical: question.link, author, published, siteName, type: "stackexchange_question" }),
+    structured: compactObject({
+      type: "stackexchange_question",
+      site: target.site,
+      question_id: question.question_id,
+      title,
+      score: question.score,
+      answer_count: question.answer_count,
+      view_count: question.view_count,
+      tags: question.tags,
+      is_answered: question.is_answered,
+      accepted_answer_id: question.accepted_answer_id,
+      author,
+      published,
+      answers: answers.map((answer) => compactObject({
+        answer_id: answer.answer_id,
+        score: answer.score,
+        is_accepted: answer.is_accepted,
+        author: decodeEntities(answer.owner?.display_name || ""),
+        created: unixSecondsIso(answer.creation_date),
+      })),
+      quota_remaining: questionJson.quota_remaining,
+    }),
+  };
+}
+
+async function fetchJsonApi(url, signal) {
+  const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": DESKTOP_CHROME_UA }, signal });
+  const json = await response.json();
+  if (!response.ok || json?.error_id || json?.error_name) {
+    throw new Error(json?.error_name || `HTTP ${response.status}`);
+  }
+  return {
+    json,
+    status: response.status,
+    finalUrl: response.url || url,
+    contentType: response.headers.get("content-type") || "application/json",
+    contentLength: response.headers.get("content-length") || "",
+  };
+}
+
+async function trySiteApiFirst(url, opts, signal, warnings, debugInfo) {
+  if (opts.site_preset !== "auto") return null;
+  const hnTarget = hackerNewsApiTarget(url);
+  const seTarget = stackExchangeQuestionTarget(url);
+  if (!hnTarget && !seTarget) return null;
+
+  try {
+    let page;
+    let responseInfo;
+    let source;
+    let urlKind;
+    let warning;
+    let apiUrl;
+    let rawJson;
+    if (hnTarget) {
+      apiUrl = hnTarget.apiUrl;
+      responseInfo = await fetchJsonApi(apiUrl, signal);
+      if (!responseInfo) throw new Error("Hacker News item was not found");
+      rawJson = responseInfo.json;
+      page = hnTarget.kind === "item"
+        ? extractHackerNewsItemData(url, rawJson, opts)
+        : extractHackerNewsFrontPageData(url, rawJson, opts);
+      source = "hn-algolia";
+      urlKind = "hn-algolia";
+      warning = "Hacker News HTML은 Worker를 차단하므로 Algolia 공식 API로 가져옴";
+    } else {
+      let questionId = seTarget.questionId;
+      let linkedAnswer = null;
+      if (seTarget.answerId) {
+        apiUrl = `https://api.stackexchange.com/2.3/answers/${seTarget.answerId}?site=${encodeURIComponent(seTarget.site)}`;
+        const linkedResponse = await fetchJsonApi(apiUrl, signal);
+        linkedAnswer = linkedResponse?.json?.items?.[0] || null;
+        questionId = linkedAnswer?.question_id;
+        if (!questionId) throw new Error("linked answer was not found");
+      }
+      const questionUrl = `https://api.stackexchange.com/2.3/questions/${questionId}?site=${encodeURIComponent(seTarget.site)}&filter=withbody`;
+      const answersUrl = `https://api.stackexchange.com/2.3/questions/${questionId}/answers?site=${encodeURIComponent(seTarget.site)}&filter=withbody&sort=votes&order=desc&pagesize=10`;
+      apiUrl = questionUrl;
+      const [questionResponse, answersResponse] = await Promise.all([fetchJsonApi(questionUrl, signal), fetchJsonApi(answersUrl, signal)]);
+      if (!questionResponse || !answersResponse) throw new Error("Stack Exchange question or answers were not found");
+      if (linkedAnswer) {
+        const linkedId = Number(linkedAnswer.answer_id);
+        const answers = answersResponse.json.items || [];
+        const index = answers.findIndex((answer) => Number(answer.answer_id) === linkedId);
+        const selected = index >= 0 ? answers.splice(index, 1)[0] : linkedAnswer;
+        answers.unshift({ ...selected, _linked: true });
+      }
+      rawJson = { question: questionResponse.json, answers: answersResponse.json };
+      responseInfo = questionResponse;
+      page = extractStackExchangeQuestionData(url, questionResponse.json, answersResponse.json, opts);
+      source = "stackexchange-api";
+      urlKind = "stackexchange-api";
+      warning = "Stack Exchange HTML은 Worker를 차단하므로 공식 API로 가져옴";
+    }
+    if (!page) return null;
+    warnings.push(warning);
+    debugInfo?.attempts?.push({
+      ua: 1,
+      url: apiUrl,
+      urlKind,
+      status: responseInfo.status,
+      finalUrl: responseInfo.finalUrl,
+      contentType: responseInfo.contentType,
+      contentLength: responseInfo.contentLength,
+      bodyChars: JSON.stringify(rawJson).length,
+    });
+    const html = JSON.stringify(rawJson);
+    return {
+      ok: true,
+      text: page.text,
+      html,
+      status: responseInfo.status,
+      attempt: 1,
+      attempt_total: 1,
+      warnings,
+      source,
+      meta: page.meta,
+      finalUrl: url,
+      contentType: responseInfo.contentType,
+      contentLength: responseInfo.contentLength || String(html.length),
+      structured: page.structured,
+    };
+  } catch (err) {
+    warnings.push(`사이트 무료 API 우선 fetch 실패: ${String(err).slice(0, 200)}`);
+    return null;
   }
 }
 
@@ -5081,6 +5616,18 @@ export {
   // Site extractors
   extractDcinsideArticleData,
   extractRedditPostData,
+  isHackerNewsUrl,
+  extractHackerNewsItemData,
+  extractHackerNewsFrontPageData,
+  stackExchangeQuestionTarget,
+  extractStackExchangeQuestionData,
+  trySiteApiFirst,
+  redditPostIdFromUrl,
+  buildRedditArchiveListing,
+  fetchRedditArchive,
+  tryRedditArchive,
+  extractYouTubeVideoData,
+  extractBalancedJson,
   extractNamuWikiData,
   cleanNamuWikiText,
   extractMediaWikiArticleData,
@@ -5107,6 +5654,8 @@ export {
   // Request shaping
   fetchHeaders,
   browserRequestHeaders,
+  chromeSecChUa,
+  CHROME_MAJOR,
 
   // Anti-bot and redirects
   extractClientRedirect,
