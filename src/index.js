@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.4.3";
+const VERSION = "1.4.4";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -2069,6 +2069,7 @@ const DCINSIDE_COMMENT_ENDPOINT = "https://gall.dcinside.com/board/comment/";
 const DCINSIDE_COMMENT_MAX_PAGES = 8;
 const DCINSIDE_COMMENT_MAX_ITEMS = 400;
 const DCINSIDE_COMMENT_PER_PAGE = 100;
+const DCINSIDE_COMMENT_REQUEST_TIMEOUT_MS = 6_000;
 
 function dcinsideIdNo(url) {
   try {
@@ -2123,7 +2124,53 @@ function dcinsideCommentMemoToText(memo) {
   return out.replace(/\s+/g, " ").trim();
 }
 
+async function fetchDcinsideViewToken(idNo, gallType, cookieJar, signal) {
+  let currentUrl = dcinsideViewUrl(idNo.id, idNo.no, gallType);
+  for (let redirects = 0; redirects <= 2; redirects++) {
+    if (signal?.aborted) throw new Error("시간 예산 소진");
+    const requestController = new AbortController();
+    let timedOut = false;
+    const requestTimer = setTimeout(() => {
+      timedOut = true;
+      requestController.abort();
+    }, DCINSIDE_COMMENT_REQUEST_TIMEOUT_MS);
+    const onAbort = () => requestController.abort();
+    signal?.addEventListener("abort", onAbort);
+    try {
+      const res = await fetch(currentUrl, {
+        method: "GET",
+        headers: fetchHeaders(DCINSIDE_DESKTOP_UA, cookieJar, { Referer: "https://www.dcinside.com/" }),
+        signal: requestController.signal,
+        redirect: "follow",
+      });
+      storeResponseCookies(cookieJar, res.headers);
+      if (!res.ok) {
+        await res.body?.cancel();
+        return { esno: "", gallType };
+      }
+      const pageHtml = await readTextResponse(res, res.headers.get("content-type") || "");
+      const esno = extractDcinsideEsno(pageHtml);
+      if (esno) return { esno, gallType: dcinsideGallType(res.url || currentUrl, pageHtml) };
+      const redirect = extractClientRedirect(res.url || currentUrl, pageHtml);
+      if (!redirect || !isDcinsideUrl(redirect.url) || isDcinsideAuthOrSinkUrl(redirect.url)) {
+        return { esno: "", gallType };
+      }
+      currentUrl = redirect.url;
+      gallType = dcinsideGallType(currentUrl, pageHtml);
+    } catch (err) {
+      if (signal?.aborted) throw new Error("시간 예산 소진");
+      if (timedOut || err?.name === "AbortError") throw new Error("시간 초과");
+      throw err;
+    } finally {
+      clearTimeout(requestTimer);
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+  return { esno: "", gallType };
+}
+
 async function fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, signal) {
+  if (signal?.aborted) return { error: "시간 예산 소진" };
   const params = new URLSearchParams({
     id: idNo.id,
     no: idNo.no,
@@ -2141,20 +2188,40 @@ async function fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, s
     Origin: "https://gall.dcinside.com",
     Referer: dcinsideViewUrl(idNo.id, idNo.no, gallType),
   }, "xhr");
-  const res = await fetch(DCINSIDE_COMMENT_ENDPOINT, {
-    method: "POST",
-    headers,
-    body: params.toString(),
-    signal,
-    redirect: "follow",
-  });
-  storeResponseCookies(cookieJar, res.headers);
-  if (!res.ok) return null;
-  const textBody = await readTextResponse(res, res.headers.get("content-type") || "");
+  const requestController = new AbortController();
+  let timedOut = false;
+  const requestTimer = setTimeout(() => {
+    timedOut = true;
+    requestController.abort();
+  }, DCINSIDE_COMMENT_REQUEST_TIMEOUT_MS);
+  const onAbort = () => requestController.abort();
+  signal?.addEventListener("abort", onAbort);
   try {
-    return JSON.parse(textBody);
-  } catch {
-    return null;
+    const res = await fetch(DCINSIDE_COMMENT_ENDPOINT, {
+      method: "POST",
+      headers,
+      body: params.toString(),
+      signal: requestController.signal,
+      redirect: "follow",
+    });
+    storeResponseCookies(cookieJar, res.headers);
+    if (!res.ok) {
+      await res.body?.cancel();
+      return { error: `HTTP ${res.status}` };
+    }
+    const textBody = await readTextResponse(res, res.headers.get("content-type") || "");
+    try {
+      return { data: JSON.parse(textBody) };
+    } catch {
+      return { error: `JSON이 아닌 응답: ${textBody.slice(0, 40)}` };
+    }
+  } catch (err) {
+    if (signal?.aborted) return { error: "시간 예산 소진" };
+    if (timedOut || err?.name === "AbortError") return { error: "시간 초과" };
+    return { error: String(err).slice(0, 160) };
+  } finally {
+    clearTimeout(requestTimer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -2162,41 +2229,75 @@ async function fetchDcinsideComments(url, html, cookieJar, signal, opts = {}) {
   if (!isDcinsideUrl(url)) return null;
   const idNo = dcinsideIdNo(url);
   if (!idNo.id || !idNo.no) return null;
-  const gallType = dcinsideGallType(url, html);
+  let gallType = dcinsideGallType(url, html);
   let esno = extractDcinsideEsno(html);
-
-  // Mobile/redirect variants may not carry the desktop token. Fetch the
-  // desktop view once to obtain e_s_n_o and refresh session cookies.
-  if (!esno) {
-    try {
-      const viewUrl = dcinsideViewUrl(idNo.id, idNo.no, gallType);
-      const res = await fetch(viewUrl, {
-        method: "GET",
-        headers: fetchHeaders(DCINSIDE_DESKTOP_UA, cookieJar, { Referer: "https://www.dcinside.com/" }),
-        signal,
-        redirect: "follow",
-      });
-      storeResponseCookies(cookieJar, res.headers);
-      const pageHtml = await readTextResponse(res, res.headers.get("content-type") || "");
-      esno = extractDcinsideEsno(pageHtml);
-    } catch { /* fall through to early return */ }
-  }
-  if (!esno) return null;
-
   const items = [];
   let total = 0;
-  for (let page = 1; page <= DCINSIDE_COMMENT_MAX_PAGES; page++) {
-    if (signal?.aborted) break;
-    let data = null;
+  let refreshedToken = false;
+  let retries = 0;
+
+  const failure = (error) => ({
+    total: total || items.length,
+    items,
+    truncated: items.length >= DCINSIDE_COMMENT_MAX_ITEMS,
+    error,
+  });
+
+  if (!esno) {
     try {
-      data = await fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, signal);
-    } catch {
-      break;
+      const token = await fetchDcinsideViewToken(idNo, gallType, cookieJar, signal);
+      esno = token.esno;
+      gallType = token.gallType;
+    } catch (err) {
+      return failure(err instanceof Error ? err.message : String(err));
     }
-    if (!data || !Array.isArray(data.comments)) break;
-    if (Number.isFinite(Number(data.total_cnt))) total = Number(data.total_cnt);
-    let added = 0;
-    for (const c of data.comments) {
+  }
+  if (!esno) return failure("e_s_n_o 토큰을 찾지 못함");
+
+  for (let page = 1; page <= DCINSIDE_COMMENT_MAX_PAGES; page++) {
+    let pageRetried = false;
+    let data;
+    while (true) {
+      if (signal?.aborted) return failure("시간 예산 소진");
+      const result = await fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, signal);
+      let error = result.error;
+      data = result.data;
+      // Only page 1 can tell a refused request from an empty thread. Past it,
+      // the site answers an out-of-range page with an empty list, so a
+      // well-formed reply without comments is the end of the thread.
+      if (!error && page === 1) {
+        const pageTotal = Number(data?.total_cnt);
+        const list = data?.comments;
+        if (pageTotal > 0 && !(Array.isArray(list) && list.length)) {
+          error = `댓글 수는 ${pageTotal}인데 목록이 비어 있음`;
+        } else if (pageTotal !== 0 && !Array.isArray(list)) {
+          error = "댓글 목록이 없는 응답";
+        }
+      }
+      if (!error) break;
+      if (signal?.aborted) return failure("시간 예산 소진");
+      if (pageRetried || retries >= 2) return failure(error);
+      if (!refreshedToken) {
+        refreshedToken = true;
+        // A refresh that fails still leaves the current token worth one retry.
+        try {
+          const token = await fetchDcinsideViewToken(idNo, gallType, cookieJar, signal);
+          if (token.esno) {
+            esno = token.esno;
+            gallType = token.gallType;
+          }
+        } catch {
+          if (signal?.aborted) return failure("시간 예산 소진");
+        }
+      }
+      pageRetried = true;
+      retries++;
+    }
+
+    const comments = Array.isArray(data?.comments) ? data.comments : [];
+    if (Number.isFinite(Number(data?.total_cnt))) total = Number(data.total_cnt);
+    if (page === 1 && total === 0 && !comments.length) return null;
+    for (const c of comments) {
       if (!c || c.del_yn === "Y" || c.is_delete === "1") continue;
       const memo = dcinsideCommentMemoToText(c.memo);
       const body = memo || (c.vr_type || c.voice ? "[보이스 리플]" : "");
@@ -2210,11 +2311,10 @@ async function fetchDcinsideComments(url, html, cookieJar, signal, opts = {}) {
         date: String(c.reg_date || "").trim(),
         memo: body,
       });
-      added++;
       if (items.length >= DCINSIDE_COMMENT_MAX_ITEMS) break;
     }
     if (items.length >= DCINSIDE_COMMENT_MAX_ITEMS) break;
-    if (added === 0) break;
+    if (comments.length === 0) break;
     if (total && page * DCINSIDE_COMMENT_PER_PAGE >= total) break;
   }
   if (!items.length) return null;
@@ -2240,6 +2340,7 @@ function formatDcinsideComments(data) {
     }
   }
   if (data.truncated) lines.push(`… (이하 생략, 총 ${data.total}개)`);
+  if (data.error) lines.push(`… (일부 댓글을 불러오지 못했습니다: ${data.error})`);
   return lines.join("\n");
 }
 
@@ -3685,7 +3786,7 @@ async function readFetchCache(url, opts) {
 
 async function writeFetchCache(url, opts, result) {
   if (opts.use_cache === false || typeof caches === "undefined") return;
-  if (!result.ok) return;
+  if (!result.ok || result.noCache) return;
   try {
     const ttl = Math.max(30, Math.min(opts.cache_ttl_seconds ?? CACHE_TTL_SECONDS_DEFAULT, 3600));
     const cacheable = { ...result, html: undefined };
@@ -4708,6 +4809,11 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         contentLength: result.contentLength || lastContentLength || "",
       },
     };
+    // Only the direct path loads a DCinside comment thread. Caching a degraded
+    // fallback would hide the comments for the whole TTL after one bad attempt.
+    if (result.partial && normalizedOpts.site_preset === "dcinside" && normalizedOpts.include_comments && dcinsideIdNo(url).no) {
+      enriched.noCache = true;
+    }
     await writeFetchCache(url, normalizedOpts, enriched);
     return enriched;
   };
@@ -4910,20 +5016,29 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         // independent of whether article-body extraction succeeded (image-only
         // posts often yield no article body but still have a comment thread).
         let dcComments = null;
+        let dcCommentsFailed = false;
         if (normalizedOpts.site_preset === "dcinside" && normalizedOpts.include_comments) {
           try {
-            dcComments = await fetchDcinsideComments(url, body, cookieJar, overallController.signal, normalizedOpts);
+            const finalIdNo = isDcinsideUrl(lastFinalUrl) ? dcinsideIdNo(lastFinalUrl) : { id: "", no: "" };
+            const commentUrl = finalIdNo.id && finalIdNo.no ? lastFinalUrl : url;
+            dcComments = await fetchDcinsideComments(commentUrl, body, cookieJar, overallController.signal, normalizedOpts);
+            if (dcComments?.error) {
+              dcCommentsFailed = true;
+              warnings.push(`디시 댓글 로드 실패: ${dcComments.error}`);
+            }
           } catch (err) {
+            dcCommentsFailed = true;
             warnings.push(`디시 댓글 로드 실패: ${String(err).slice(0, 160)}`);
           }
         }
+        const hasDcComments = (dcComments?.items?.length || 0) > 0;
         let text = sitePage?.text
           || htmlToText(body, normalizedOpts.cleaning_mode, { include_links: normalizedOpts.include_links, base_url: lastFinalUrl });
-        if (dcComments) {
+        if (hasDcComments) {
           const commentBlock = formatDcinsideComments(dcComments);
           if (commentBlock) text = `${text}\n\n${commentBlock}`;
         }
-        if (sitePage || dcComments || hasMeaningfulHtmlContent(body, text)) {
+        if (sitePage || hasDcComments || hasMeaningfulHtmlContent(body, text)) {
           // Extract meta once here so the tool handler can reuse it.
           const meta = sitePage?.meta || extractMetadata(body);
           // Extractors that report no meta of their own (namu, dcinside) still
@@ -4933,12 +5048,13 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
           }
           let structured = sitePage?.structured
             || extractSiteStructuredData(lastFinalUrl, body, text, meta, normalizedOpts.site_preset);
-          if (dcComments) {
+          if (hasDcComments) {
             structured = { ...(structured || {}), comment_count: dcComments.total, comments: dcComments.items };
           }
           recordDirectStage(true);
           return finish({
             ok: true,
+            noCache: dcCommentsFailed,
             text,
             html: body,
             status,
