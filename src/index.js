@@ -2262,16 +2262,15 @@ async function fetchDcinsideComments(url, html, cookieJar, signal, opts = {}) {
       const result = await fetchDcinsideCommentPage(idNo, gallType, esno, cookieJar, page, signal);
       let error = result.error;
       data = result.data;
-      // Only page 1 can tell a refused request from an empty thread. Past it,
-      // the site answers an out-of-range page with an empty list, so a
-      // well-formed reply without comments is the end of the thread.
-      if (!error && page === 1) {
+      // The site answers an empty thread with total_cnt 0 and an out-of-range
+      // page with an empty list, so any other reply without a list is a refusal.
+      if (!error) {
         const pageTotal = Number(data?.total_cnt);
         const list = data?.comments;
-        if (pageTotal > 0 && !(Array.isArray(list) && list.length)) {
-          error = `댓글 수는 ${pageTotal}인데 목록이 비어 있음`;
-        } else if (pageTotal !== 0 && !Array.isArray(list)) {
+        if (!Array.isArray(list) && !(page === 1 && pageTotal === 0)) {
           error = "댓글 목록이 없는 응답";
+        } else if (page === 1 && pageTotal > 0 && !list.length) {
+          error = `댓글 수는 ${pageTotal}인데 목록이 비어 있음`;
         }
       }
       if (!error) break;
@@ -5019,7 +5018,9 @@ async function fetchPageWithFallbacks(url, apiKey, opts = {}) {
         let dcCommentsFailed = false;
         if (normalizedOpts.site_preset === "dcinside" && normalizedOpts.include_comments) {
           try {
-            const finalIdNo = isDcinsideUrl(lastFinalUrl) ? dcinsideIdNo(lastFinalUrl) : { id: "", no: "" };
+            // A desktop final URL names the gallery the post really lives in; a
+            // mobile one names no gallery type, so the requested URL knows more.
+            const finalIdNo = /^https:\/\/gall\.dcinside\.com\//i.test(lastFinalUrl) ? dcinsideIdNo(lastFinalUrl) : { id: "", no: "" };
             const commentUrl = finalIdNo.id && finalIdNo.no ? lastFinalUrl : url;
             dcComments = await fetchDcinsideComments(commentUrl, body, cookieJar, overallController.signal, normalizedOpts);
             if (dcComments?.error) {

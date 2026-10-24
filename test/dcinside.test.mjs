@@ -183,13 +183,18 @@ test("dcinside: mobile minor-gallery body follows the desktop client redirect fo
     { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: COMMENTS_JSON,
       headers: { "content-type": "application/json; charset=utf-8" } },
     { url: "https://gall.dcinside.com/board/view/", body: '<script type="text/javascript">location.replace("https://gall.dcinside.com/mgallery/board/view?id=stockus&no=1234567");</script>' },
-    { url: "https://gall.dcinside.com/mgallery/board/view", body: VIEW_HTML },
+    { url: "https://gall.dcinside.com/mgallery/board/view", body: VIEW_HTML.replace("var _GALLTYPE_ = 'G';", "var _GALLTYPE_ = 'M';") },
   ]);
   try {
     const data = await fetchDcinsideComments(mobileUrl, "<html>모바일 본문, 토큰 없음</html>", new Map(), undefined, {});
     assert.equal(data.items.length, 3);
     assert.equal(stub.matching("/mgallery/board/view").length, 1);
-    assert.equal(formBody(stub.matching("/board/comment/")[0]).e_s_n_o, "3eabbdc6c0dcbc9a0d");
+    const post = stub.matching("/board/comment/")[0];
+    const sent = formBody(post);
+    assert.equal(sent.e_s_n_o, "3eabbdc6c0dcbc9a0d");
+    assert.equal(sent.id, "stockus");
+    assert.equal(sent._GALLTYPE_, "M", "the comment XHR must name the minor gallery it followed the redirect to");
+    assert.match(post.headers.Referer, /\/mgallery\/board\/view\/\?id=stockus&no=1234567/);
   } finally {
     stub.restore();
   }
@@ -314,19 +319,34 @@ test("dcinside: later-page failure preserves and marks partial comments", async 
   }
 });
 
-test("dcinside: a well-formed later page without a list ends the thread quietly", async () => {
-  const stub = installFetch([
+function laterPageRoutes(laterPage) {
+  return [
     { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: (url, init) => {
       const page = Number(formBody({ body: init.body }).comment_page);
-      return page === 1
-        ? JSON.stringify({ ...JSON.parse(COMMENTS_JSON), total_cnt: 150 })
-        : JSON.stringify({ total_cnt: 150, comments: null });
+      return page === 1 ? JSON.stringify({ ...JSON.parse(COMMENTS_JSON), total_cnt: 150 }) : JSON.stringify(laterPage);
     }, headers: { "content-type": "application/json; charset=utf-8" } },
-  ]);
+    { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+  ];
+}
+
+test("dcinside: an empty later page ends the thread quietly", async () => {
+  // The site answers a page past the end with an empty list, not an error.
+  const stub = installFetch(laterPageRoutes({ total_cnt: 150, comments: [] }));
   try {
     const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
     assert.equal(data.items.length, 3);
     assert.equal(data.error, undefined, "an empty later page is the end of the thread, not a failure");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: a later page without a list is a failure, not the end of the thread", async () => {
+  const stub = installFetch(laterPageRoutes({ error: "temporarily unavailable" }));
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3, "the first page must survive");
+    assert.match(data.error, /댓글 목록이 없는 응답/);
   } finally {
     stub.restore();
   }
