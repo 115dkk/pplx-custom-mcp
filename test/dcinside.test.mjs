@@ -176,3 +176,225 @@ test("dcinside: a failing comment API still yields the article body", async () =
     stub.restore();
   }
 });
+
+test("dcinside: mobile minor-gallery body follows the desktop client redirect for a token", async () => {
+  const mobileUrl = "https://m.dcinside.com/board/stockus/1234567";
+  const stub = installFetch([
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: COMMENTS_JSON,
+      headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", body: '<script type="text/javascript">location.replace("https://gall.dcinside.com/mgallery/board/view?id=stockus&no=1234567");</script>' },
+    { url: "https://gall.dcinside.com/mgallery/board/view", body: VIEW_HTML.replace("var _GALLTYPE_ = 'G';", "var _GALLTYPE_ = 'M';") },
+  ]);
+  try {
+    const data = await fetchDcinsideComments(mobileUrl, "<html>모바일 본문, 토큰 없음</html>", new Map(), undefined, {});
+    assert.equal(data.items.length, 3);
+    assert.equal(stub.matching("/mgallery/board/view").length, 1);
+    const post = stub.matching("/board/comment/")[0];
+    const sent = formBody(post);
+    assert.equal(sent.e_s_n_o, "3eabbdc6c0dcbc9a0d");
+    assert.equal(sent.id, "stockus");
+    assert.equal(sent._GALLTYPE_, "M", "the comment XHR must name the minor gallery it followed the redirect to");
+    assert.match(post.headers.Referer, /\/mgallery\/board\/view\/\?id=stockus&no=1234567/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: transient non-JSON comment response refreshes the token and recovers", async () => {
+  let commentCalls = 0;
+  const stub = installFetch([
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: () => {
+      commentCalls++;
+      return commentCalls === 1 ? "정상적인 접근이 아닙니다." : COMMENTS_JSON;
+    }, headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+  ]);
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3);
+    assert.equal(data.error, undefined);
+    assert.equal(stub.matching("/board/view/").length, 1);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: persistent comment failure warns and skips cache while success is cached", async () => {
+  const puts = [];
+  globalThis.caches = { default: {
+    match: async () => undefined,
+    put: async (...args) => { puts.push(args); },
+  } };
+  let stub;
+  try {
+    stub = installFetch([
+      { url: "https://gall.dcinside.com/board/comment/", method: "POST", status: 500, body: "boom" },
+      { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+    ]);
+    const failed = await fetchAndFormat(POST_URL, "", { include_images: false, use_cache: true, include_comments: true });
+    assert.match(failed.text, new RegExp(BODY_SENTENCE));
+    assert.ok(failed.result.warnings.some((warning) => warning.includes("디시 댓글 로드 실패")));
+    assert.equal(puts.length, 0);
+    stub.restore();
+
+    stub = installFetch(routes());
+    await fetchAndFormat(POST_URL, "", { include_images: false, use_cache: true, include_comments: true });
+    assert.equal(puts.length, 1);
+  } finally {
+    stub?.restore();
+    delete globalThis.caches;
+  }
+});
+
+test("dcinside: zero comments is a successful cacheable result", async () => {
+  const puts = [];
+  globalThis.caches = { default: {
+    match: async () => undefined,
+    put: async (...args) => { puts.push(args); },
+  } };
+  const zeroRoutes = [
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST",
+      body: '{"total_cnt":0,"comment_cnt":0,"comments":null}',
+      headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+  ];
+  let stub;
+  try {
+    stub = installFetch(zeroRoutes);
+    assert.equal(await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {}), null);
+    stub.restore();
+
+    stub = installFetch(zeroRoutes);
+    const { result } = await fetchAndFormat(POST_URL, "", { include_images: false, use_cache: true, include_comments: true });
+    assert.ok(!result.warnings.some((warning) => warning.includes("디시 댓글 로드 실패")));
+    assert.equal(puts.length, 1);
+  } finally {
+    stub?.restore();
+    delete globalThis.caches;
+  }
+});
+
+test("dcinside: an all-deleted page does not hide comments on the next page", async () => {
+  const deleted = Array.from({ length: 100 }, (_, index) => ({
+    no: String(index + 1),
+    del_yn: "Y",
+    memo: "삭제된 댓글입니다",
+  }));
+  const stub = installFetch([
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: (url, init) => {
+      const page = Number(formBody({ body: init.body }).comment_page);
+      return page === 1
+        ? JSON.stringify({ total_cnt: 101, comments: deleted })
+        : JSON.stringify({ total_cnt: 101, comments: [{ no: "101", name: "생존자", memo: "두 번째 페이지 댓글" }] });
+    }, headers: { "content-type": "application/json; charset=utf-8" } },
+  ]);
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 1);
+    assert.equal(data.items[0].memo, "두 번째 페이지 댓글");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: later-page failure preserves and marks partial comments", async () => {
+  let pageTwoCalls = 0;
+  const firstPage = JSON.stringify({ ...JSON.parse(COMMENTS_JSON), total_cnt: 150 });
+  const stub = installFetch([
+    { url: (url, init) => url.startsWith("https://gall.dcinside.com/board/comment/")
+        && formBody({ body: init.body }).comment_page === "2", method: "POST", status: 500,
+      body: () => { pageTwoCalls++; return "boom"; } },
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: firstPage,
+      headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+  ]);
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3);
+    assert.match(data.error, /HTTP 500/);
+    assert.equal(pageTwoCalls, 2);
+    assert.match(formatDcinsideComments(data), /일부 댓글을 불러오지 못했습니다/);
+  } finally {
+    stub.restore();
+  }
+});
+
+function laterPageRoutes(laterPage) {
+  return [
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: (url, init) => {
+      const page = Number(formBody({ body: init.body }).comment_page);
+      return page === 1 ? JSON.stringify({ ...JSON.parse(COMMENTS_JSON), total_cnt: 150 }) : JSON.stringify(laterPage);
+    }, headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", body: VIEW_HTML },
+  ];
+}
+
+test("dcinside: an empty later page ends the thread quietly", async () => {
+  // The site answers a page past the end with an empty list, not an error.
+  const stub = installFetch(laterPageRoutes({ total_cnt: 150, comments: [] }));
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3);
+    assert.equal(data.error, undefined, "an empty later page is the end of the thread, not a failure");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: a later page without a list is a failure, not the end of the thread", async () => {
+  const stub = installFetch(laterPageRoutes({ error: "temporarily unavailable" }));
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3, "the first page must survive");
+    assert.match(data.error, /댓글 목록이 없는 응답/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: a failed token refresh still retries with the current token", async () => {
+  let commentCalls = 0;
+  const stub = installFetch([
+    { url: "https://gall.dcinside.com/board/comment/", method: "POST", body: () => {
+      commentCalls++;
+      return commentCalls === 1 ? "정상적인 접근이 아닙니다." : COMMENTS_JSON;
+    }, headers: { "content-type": "application/json; charset=utf-8" } },
+    { url: "https://gall.dcinside.com/board/view/", status: 500, body: "boom" },
+  ]);
+  try {
+    const data = await fetchDcinsideComments(POST_URL, VIEW_HTML, new Map(), undefined, {});
+    assert.equal(data.items.length, 3);
+    assert.equal(formBody(stub.matching("/board/comment/")[1]).e_s_n_o, "3eabbdc6c0dcbc9a0d");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("dcinside: a degraded fallback for a post is not cached while comments are wanted", async () => {
+  const puts = [];
+  globalThis.caches = { default: {
+    match: async () => undefined,
+    put: async (...args) => { puts.push(args); },
+  } };
+  const blockedRoutes = () => [
+    { url: "https://archive.org/wayback/available", body: JSON.stringify({ archived_snapshots: {} }),
+      headers: { "content-type": "application/json" } },
+    { url: (u) => /^https:\/\/(?:gall|m)\.dcinside\.com\//.test(u), status: 403,
+      body: "<html><head><title>Just a moment...</title></head><body>Access denied</body></html>" },
+  ];
+  let stub;
+  try {
+    stub = installFetch(blockedRoutes());
+    const { result } = await fetchAndFormat(POST_URL, "", { include_images: false, use_cache: true, include_comments: true });
+    assert.equal(result.source, "metadata");
+    assert.equal(puts.length, 0, "a result without its comment thread must not stick for the TTL");
+    stub.restore();
+
+    stub = installFetch(blockedRoutes());
+    await fetchAndFormat(POST_URL, "", { include_images: false, use_cache: true, include_comments: false });
+    assert.equal(puts.length, 1, "without comments requested the degraded result is cached as before");
+  } finally {
+    stub?.restore();
+    delete globalThis.caches;
+  }
+});
