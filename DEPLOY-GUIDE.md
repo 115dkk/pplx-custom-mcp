@@ -95,6 +95,6 @@ Codex 앱·CLI·IDE 확장은 같은 MCP 설정을 공유합니다. 등록 후 �
   - `perplexity_search_fetch` — 검색 + dedupe + 상위 K개 fetch 원샷 워크플로
   - 모든 도구는 `outputSchema`와 `structuredContent`를 제공
 
-> 나무위키가 UA와 출구 IP를 함께 차단하면 현재판 본문은 Wayback Machine 최신 캡처(무료)로 대체 제공되며, 캡처 날짜가 본문과 경고에 명시됩니다. 아카이브에 없는 문서·과거판(`rev=`)은 Workers와 Perplexity 폴백만으로 본문을 보장할 수 없어 실패로 명시됩니다.
+> 나무위키가 UA와 출구 IP를 함께 차단하면 현재판 본문은 실시간 미러 namu.moe(무료)에서 가져오고, 문서의 최근 수정 시각을 본문 헤더에 표시합니다. 미러에 문서가 없거나 미러가 응답하지 않으면 Wayback Machine 최신 캡처(무료)로 대체하고, 캡처 날짜는 본문과 경고에 표시합니다. 아카이브에 없는 문서·과거판(`rev=`)은 Workers와 Perplexity 폴백만으로 본문을 보장할 수 없어 실패로 명시됩니다.
 - **CORS**: 모든 origin 허용 (Claude.ai 브라우저 클라이언트 지원)
 - **비용**: Workers 무료. 직접 fetch는 무료. 막힌 페이지의 `fetch_url`은 도구 호출 $0.0005 + 모델 토큰 비용이며, 후속 검색 폴백은 호출당 $0.005.
