@@ -85,7 +85,7 @@ Codex 앱·CLI·IDE 확장은 같은 MCP 설정을 공유합니다. 등록 후 �
 
 ## 아키텍처 참고
 
-- **Stateless**: `createMcpHandler` 사용 (Durable Object 불필요, 무료 티어 호환)
+- **Stateless**: `agents/mcp`의 `createLegacyMcpHandler` 사용 (Durable Object 불필요, 무료 티어 호환). 서버가 MCP SDK v1이라서 이 처리기를 씁니다. agents 다음 메이저 버전에서 SDK v1 지원이 빠지기 전에 `@modelcontextprotocol/server`(SDK v2)로 옮겨야 합니다
 - **MCP SDK ≥1.26.0 호환**: 요청마다 새 McpServer 인스턴스 생성
 - **4개 도구** (v1.4.0):
   - `perplexity_search` — Perplexity `/search` 호출, source_profile/dedupe/date signals 지원, ~$0.005/회
