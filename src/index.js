@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.5.1";
+const VERSION = "1.5.2";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -595,15 +595,54 @@ function markdownLinkText(text) {
     .trim();
 }
 
+// Links are shown with percent-encoded UTF-8 decoded: a link to 대한민국 reads
+// as itself instead of %EB%8C%80%ED%95%9C..., which on a Korean wiki page cuts
+// the body several-fold. This only changes display. The URL parser re-encodes
+// the same bytes, so the readable link fetches the same resource.
+//
+// Only runs of non-ASCII escapes are decoded. ASCII escapes (%20 %2F %3F %23
+// %25 ...) keep their meaning as path, query and fragment boundaries. A run
+// that is not valid UTF-8 (legacy EUC-KR) stays encoded, and so does one that
+// decodes to a control, format (bidi override, zero-width) or space character,
+// so a link can neither change meaning nor disguise where it points.
+const NON_ASCII_ESCAPE_RUN_RE = /(?:%[89a-f][0-9a-f])+/gi;
+const HIDDEN_URL_CHAR_RE = /[\p{C}\p{Z}]/u;
+
+function readableUrl(url) {
+  return String(url || "").replace(NON_ASCII_ESCAPE_RUN_RE, (run) => {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(run);
+    } catch {
+      return run;
+    }
+    return HIDDEN_URL_CHAR_RE.test(decoded) ? run : decoded;
+  });
+}
+
 function markdownLinkUrl(url) {
-  return String(url || "").replace(/</g, "%3C").replace(/>/g, "%3E").trim();
+  return readableUrl(url).replace(/</g, "%3C").replace(/>/g, "%3E").trim();
+}
+
+// A label that is itself a URL (an anchor with no text, or text that repeats
+// its href) gets the same readable form as the destination.
+function readableLinkLabel(label) {
+  const text = String(label || "");
+  return /^\s*[a-z][a-z0-9+.-]*:\/\//i.test(text) ? readableUrl(text) : text;
 }
 
 function markdownLink(label, url) {
   const safeUrl = markdownLinkUrl(url);
-  const safeLabel = markdownLinkText(label) || safeUrl;
+  const safeLabel = markdownLinkText(readableLinkLabel(label)) || safeUrl;
   return safeUrl ? `[${safeLabel}](<${safeUrl}>)` : safeLabel;
 }
+
+// A Markdown link destination is either <...>, which may contain parentheses
+// (NamuWiki titles such as 미러(웹사이트) often do), or a bare run with no
+// whitespace or ')'. Group 1: preceding char, 2: label, 3: <...> form, 4: bare.
+const MARKDOWN_LINK_RE = /(^|[^!])\[([^\]\n]{1,400})\]\(\s*(?:<([^<>\n]+)>|([^)\s]+))(?:\s+["'][^"']*["'])?\s*\)/g;
+const MARKDOWN_LINK_OR_IMAGE_RE = /!?\[([^\]\n]{0,400})\]\(\s*(?:<[^<>\n]+>|[^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/g;
+const ANGLE_AUTOLINK_RE = /<((?:https?:\/\/|mailto:|tel:)[^>\s]+)>/gi;
 
 // Index of the '>' that closes the tag opening at `start`, skipping any '>'
 // inside a quoted attribute value, or -1. One forward pass.
@@ -660,8 +699,8 @@ function htmlLinksToMarkdown(html, { include_links = false, base_url = "" } = {}
 
 function stripMarkdownLinks(text) {
   return String(text || "")
-    .replace(/!?\[([^\]\n]{0,400})\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g, "$1")
-    .replace(/<((?:https?:\/\/|mailto:|tel:)[^>\s]+)>/gi, "$1");
+    .replace(MARKDOWN_LINK_OR_IMAGE_RE, "$1")
+    .replace(ANGLE_AUTOLINK_RE, "$1");
 }
 
 function cleanMarkdownText(markdown, mode = "balanced", opts = {}) {
@@ -675,21 +714,26 @@ function extractLinksFromMarkdown(text, baseUrl = "", limit = 80) {
   const links = [];
   const seen = new Set();
   const add = (label, href) => {
-    const url = normalizeLinkHref(href, baseUrl);
+    const url = readableUrl(normalizeLinkHref(href, baseUrl));
     if (!url || seen.has(url)) return;
     seen.add(url);
-    links.push({ text: markdownLinkText(label) || url, url });
+    links.push({ text: markdownLinkText(readableLinkLabel(label)) || url, url });
   };
 
-  for (const match of String(text || "").matchAll(/(^|[^!])\[([^\]\n]{1,400})\]\(\s*<?([^)\s>]+)>?(?:\s+["'][^"']*["'])?\s*\)/g)) {
-    add(match[2], match[3]);
+  let rest = String(text || "");
+  for (const match of rest.matchAll(MARKDOWN_LINK_RE)) {
+    add(match[2], match[3] ?? match[4]);
     if (links.length >= limit) return links;
   }
-  for (const match of String(text || "").matchAll(/<((?:https?:\/\/|mailto:|tel:)[^>\s]+)>/gi)) {
+  // The later passes see only text outside Markdown links, so a destination
+  // is not picked up again, cut short at its first parenthesis.
+  rest = rest.replace(MARKDOWN_LINK_RE, "$1 ");
+  for (const match of rest.matchAll(ANGLE_AUTOLINK_RE)) {
     add(match[1], match[1]);
     if (links.length >= limit) return links;
   }
-  for (const match of String(text || "").matchAll(/\bhttps?:\/\/[^\s<>()\]]+/gi)) {
+  rest = rest.replace(ANGLE_AUTOLINK_RE, " ");
+  for (const match of rest.matchAll(/\bhttps?:\/\/[^\s<>()\]]+/gi)) {
     add(match[0], match[0].replace(/[.,;:!?]+$/g, ""));
     if (links.length >= limit) return links;
   }
@@ -6540,6 +6584,7 @@ export {
   stripHtmlTagsQuoteAware,
   htmlLinksToMarkdown,
   extractLinksFromMarkdown,
+  readableUrl,
   extractMetadata,
   decodeEntities,
   paginateText,
