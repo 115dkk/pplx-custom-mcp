@@ -16,6 +16,13 @@ const MIRROR_URL = "https://www.namu.moe/w/%EA%B1%B0%EC%9A%B8%20%EC%8B%9C%ED%97%
 const WAYBACK_AVAILABILITY = "https://archive.org/wayback/available";
 const SNAPSHOT_TS = "20261030112233";
 
+// Endpoint checks are anchored to the exact origin prefix, never a host
+// substring, so a look-alike host cannot satisfy or dodge an assertion.
+const isArchiveCall = (url) => url.startsWith("https://archive.org/") || url.startsWith("https://web.archive.org/");
+const isMirrorCall = (url) => url.startsWith("https://www.namu.moe/");
+const isPerplexityCall = (url) => url.startsWith("https://api.perplexity.ai/");
+const countCalls = (stub, predicate) => stub.calls.filter((call) => predicate(call.url)).length;
+
 function closest(originalUrl = PAGE_URL) {
   return {
     available: true,
@@ -97,8 +104,8 @@ test("fallback ladder uses the live mirror before archives or paid retrieval", a
     assert.equal(result.partial, false);
     assert.match(result.text, /^\[나무위키가 직접 접근을 차단 → 실시간 미러 namu\.moe 본문 사용/);
     assert.match(result.text, /2026-10-31 12:34:56/);
-    assert.equal(stub.matching("archive.org").length, 0);
-    assert.equal(stub.matching("api.perplexity.ai").length, 0);
+    assert.equal(countCalls(stub, isArchiveCall), 0);
+    assert.equal(countCalls(stub, isPerplexityCall), 0);
   } finally {
     stub.restore();
   }
@@ -109,8 +116,8 @@ test("fallback ladder reaches Wayback after mirror 404", async () => {
   try {
     const result = await fetchPageWithFallbacks(PAGE_URL, "", OFFLINE);
     assert.equal(result.source, "wayback");
-    assert.equal(stub.matching("namu.moe").length, 1);
-    assert.equal(stub.matching("archive.org/wayback/available").length, 1);
+    assert.equal(countCalls(stub, isMirrorCall), 1);
+    assert.equal(countCalls(stub, (url) => url.startsWith(WAYBACK_AVAILABILITY)), 1);
   } finally {
     stub.restore();
   }
@@ -137,7 +144,7 @@ test("historical revision URLs skip the live mirror", async () => {
   try {
     const result = await fetchPageWithFallbacks(revisionUrl, "", OFFLINE);
     assert.equal(result.source, "wayback");
-    assert.equal(stub.matching("namu.moe").length, 0);
+    assert.equal(countCalls(stub, isMirrorCall), 0);
   } finally {
     stub.restore();
   }
@@ -186,7 +193,7 @@ test("mirror redirect accepts a double-encoded target title carried with from", 
     assert.equal(result.source, "namu-mirror");
     assert.equal(result.structured.title, targetTitle);
     assert.ok(result.warnings.includes(`나무위키 넘겨주기: 거울 시험 → ${targetTitle}`));
-    assert.equal(calls.some((url) => url.includes("archive.org")), false);
+    assert.equal(calls.some(isArchiveCall), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
