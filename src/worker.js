@@ -1,4 +1,5 @@
-import { createMcpHandler } from "agents/mcp";
+// createServer() returns an MCP SDK v1 server; agents >=0.31 serves those only via the legacy handler.
+import { createLegacyMcpHandler } from "agents/mcp";
 import { createServer, VERSION } from "./index.js";
 
 // ── Workers fetch handler ───────────────────────────────────────────
@@ -66,7 +67,7 @@ export default {
     }
 
     const server = createServer(apiKey);
-    const handler = createMcpHandler(server);
+    const handler = createLegacyMcpHandler(server);
     const response = await handler(request, env, ctx);
 
     const corsResponse = new Response(response.body, response);
