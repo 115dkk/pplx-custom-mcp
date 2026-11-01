@@ -37,6 +37,7 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 - `url`(필수), `max_chars`(기본 8000, 상한 32000), `page`(기본 1), `cleaning_mode`(`strict`/`balanced`/`raw-ish`)
 - `site_preset`: `auto`가 URL로 사이트를 판별. `none`이면 사이트별 처리를 끔
 - `metadata_only`(선별용), `include_links`(기본 켜짐), `include_comments`(기본 켜짐), `include_images`/`max_images`(기본 2), `use_cache`/`cache_ttl_seconds`, `debug`
+- 링크 주소의 한글 같은 비ASCII 문자는 `%EB%8C%80…` 대신 `https://namu.wiki/w/대한민국`처럼 읽을 수 있는 형태로 표시합니다. 표시만 바뀌므로 그 주소로 다시 요청해도 같은 문서가 열립니다. `%20`, `%2F` 같은 ASCII 이스케이프와 UTF-8이 아닌 옛 인코딩(EUC-KR 등), 풀면 보이지 않거나 방향을 바꾸는 문자는 그대로 둡니다. 나무위키 '대한민국' 문서 기준으로 링크를 켠 본문이 46% 줄어듭니다
 - 디시인사이드 글은 본문 이미지가 자동 첨부됩니다. 다른 사이트는 이미지·스크린샷·차트 등 시각 정보가 필요할 때 `include_images=true`를 사용합니다. 성공한 이미지는 MCP 이미지 블록과 출처 URL/구조화 메타데이터를 함께 반환하므로 이미지 블록을 표시하지 않는 클라이언트에서도 원본 링크가 남습니다.
 - 본문이 `max_chars`를 넘으면 같은 `url`/`max_chars`에 `page+1`로 다시 호출
 
