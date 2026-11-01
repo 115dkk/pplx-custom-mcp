@@ -326,6 +326,7 @@ function waybackClosest(originalUrl, timestamp = NAMU_SNAPSHOT_TS) {
 
 function waybackStub({ closest, snapshotBody = "", extraRoutes = [] }) {
   return installFetch([
+    { url: "https://www.namu.moe/", status: 404, body: fixture("namu-mirror-missing.html") },
     { url: WAYBACK_AVAILABILITY, body: JSON.stringify({ archived_snapshots: closest ? { closest } : {} }), headers: { "content-type": "application/json" } },
     { url: (u) => u.includes("id_/"), body: snapshotBody },
     ...extraRoutes,

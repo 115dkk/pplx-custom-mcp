@@ -49,18 +49,20 @@ URL 하나를 직접 가져와 본문을 정제해 돌려줍니다. 직접 경�
 | Hacker News | HTML이 Worker에 419를 돌려주므로 항목(`/item?id=`)과 첫 페이지는 처음부터 Algolia 공식 API로 가져옴. 댓글 트리를 들여쓰기로 보존 |
 | Stack Exchange | Stack Overflow 등 Stack Exchange 계열 질문(`/questions/<id>`, `/q/`, `/a/`)은 Cloudflare 챌린지 대신 공식 API로 질문과 투표순 답변 10개를 가져옴. 키 없는 API 몫은 IP 단위라 Cloudflare 공유 출구에서 자주 소진되므로(`throttle_violation`), 그때는 질문 Atom 피드(질문과 최근 30개 항목의 답변 본문·점수)로 대체 |
 | YouTube | 시청 페이지의 `ytInitialPlayerResponse`에서 제목·채널·게시일·길이·조회수·설명을 추출. Worker가 429를 받으면 Wayback 캡처에서 같은 데이터를 읽음 |
-| 나무위키 | VPN/IDC 공지, `[편집]` 마커, 분류·네비게이션 상자, 목차 제거. `/raw/`는 동일 `rev`의 `/w/` 읽기 URL로 바꾸고 공식 `Perplexity-User` UA로 Worker에서 직접 확인. 직접 경로가 막히면 Wayback Machine 최신 캡처(무료)를 먼저 시도하고, 이어서 Agent·검색 폴백 사용 |
+| 나무위키 | VPN/IDC 공지, `[편집]` 마커, 분류·네비게이션 상자, 목차 제거. `/raw/`는 동일 `rev`의 `/w/` 읽기 URL로 바꾸고 공식 `Perplexity-User` UA로 Worker에서 직접 확인. Worker의 직접 요청이 차단되면 실시간 미러 namu.moe(무료, 현재판만), Wayback Machine 최신 캡처(무료), Agent·검색 폴백 순으로 시도 |
 | MediaWiki | `mw-content-text` 추출, 목차·편집 링크·알림 상자·썸네일 캡션 제거 |
 | SAGE Journals | 인용 메타 + 초록/전문 추출, 막히면 DOI로 PMC 오픈액세스 미러 폴백 |
 | SourceForge | 봇 차단된 HTML 대신 Allura REST JSON에서 위키 본문 |
 | 뉴스 | 국내외 주요 언론사 도메인 레지스트리, 레거시 한글 인코딩 디코딩, JSON-LD/Arc/일반 본문 추출, 공유·폰트·로그인·광고·관련기사 제거 |
 | Steam | 성인 연령 확인 폼 자동 통과, 앱 ID/이름/출시일/가격/태그 구조화 |
 
-그 외 공통: UA 로테이션(Chrome 157·iOS Safari 26, `sec-ch-ua`는 Chromium GREASE 규칙으로 계산), 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적(JS 리다이렉트는 본문이 거의 없는 중간 페이지에서만 따름), 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용. 직접 fetch가 403·봇 차단·빈 SPA 셸로 끝나면 `fetch_url`로 정확한 URL의 본문을 요청하고, 거부·오류·타임아웃이면 기존 Perplexity 검색 폴백으로 이어집니다. 유료 경로까지 실패하면 Wayback Machine 최신 캡처를 무료 백스톱으로 시도합니다(나무위키는 유료 호출보다 먼저 아카이브 조회).
+그 외 공통: UA 로테이션(Chrome 157·iOS Safari 26, `sec-ch-ua`는 Chromium GREASE 규칙으로 계산), 단순 확인 버튼 폼 자동 제출, meta/JS 클라이언트 리다이렉트 추적(JS 리다이렉트는 본문이 거의 없는 중간 페이지에서만 따름), 문서(PDF 등) URL 감지, SPA 셸이면 `og:*`+JSON-LD+`<noscript>` 폴백, 쿠키 배너·뉴스레터·네비게이션 등 잡음 제거, Worker Cache 단기 재사용. 직접 fetch가 403·봇 차단·빈 SPA 셸로 끝나면 `fetch_url`로 정확한 URL의 본문을 요청하고, 거부·오류·타임아웃이면 기존 Perplexity 검색 폴백으로 이어집니다. 유료 경로까지 실패하면 Wayback Machine 최신 캡처를 무료 백스톱으로 시도합니다(나무위키는 유료 호출보다 먼저 실시간 미러와 아카이브 조회).
 
 Worker의 직접 fetch는 `robots.txt`를 요청하거나 적용하지 않습니다. 크롤러가 아니라 사용자가 지목한 URL 하나를 확인하는 fetch 유틸이기 때문입니다. 나무위키 `/raw/`는 사이트가 과거판 경로를 별도로 차단하므로 동일 문서·동일 `rev`의 `/w/` 읽기 URL로 바꾼 뒤, 사용자 요청용 공식 `Perplexity-User` UA를 먼저 써서 Worker가 직접 가져옵니다. 직접 경로도 막힌 경우에만 Perplexity `fetch_url`과 동일 문서 검증 검색 폴백이 이어지며, 현재판이나 다른 `rev`가 돌아오면 폐기합니다.
 
-나무위키 WAF가 UA와 출구 IP를 함께 검증하는 시점에는 Workers, Cloudflare Browser Run, Perplexity `fetch_url`이 모두 거절될 수 있습니다. 이때는 Wayback Machine의 최신 캡처를 무료 폴백으로 사용합니다: 나무위키 URL은 유료 호출보다 먼저 아카이브를 조회하고(그 외 사이트는 유료 경로가 최신본을 주므로 유료 실패 후의 백스톱), `id_` 플래그로 원본 마크업을 받아 나무위키 추출기를 그대로 적용하며, 캡처 날짜를 본문 헤더와 경고에 명시합니다. 캡처가 요청한 문서와 다르거나 캡처 자체가 차단 페이지면 폐기합니다. 아카이브에도 없는 문서(특히 `rev=` 과거판)는 현재판을 과거판인 것처럼 반환하지 않고 실패를 명시합니다.
+나무위키 WAF는 IDC 대역을 차단하므로 Workers, Cloudflare Browser Run, Perplexity `fetch_url`의 요청을 모두 거절합니다(2026-11-01 기준 Workers 출구에서는 모든 UA가 403). 그래서 나무위키에 직접 요청이 실패하면 먼저 제3자 실시간 미러 `www.namu.moe`에서 같은 제목의 문서를 가져옵니다. 이 미러는 나무위키 편집을 몇 시간 안에 반영하고 Workers에서도 열리지만, 나무마크 틀의 조건문(`#!if`)을 해석하지 못합니다. 그 잔재는 추출기가 지우고, 문서의 최근 수정 시각은 본문 헤더에 표시합니다(`source: namu-mirror`). 본문 속 링크는 미러가 아니라 namu.wiki 원문 주소로 바꿔 돌려줍니다. 미러에는 현재판만 있으므로 `rev=` 과거판, `en.`/`ja.` 번역 사이트, 문서가 아닌 페이지(`/history/` 등)에는 미러를 쓰지 않습니다. 미러는 과거에도 갱신이 여러 번 멈췄다가 재개된 적이 있어서, 미러에 문서가 없거나 응답이 이상하면 다음 단계로 넘어갑니다.
+
+미러가 실패하면 Wayback Machine의 최신 캡처를 무료 폴백으로 사용합니다: 나무위키 URL은 유료 호출보다 먼저 아카이브를 조회하고(그 외 사이트는 유료 경로가 최신본을 주므로 유료 실패 후의 백스톱), `id_` 플래그로 원본 마크업을 받아 나무위키 추출기를 그대로 적용하며, 캡처 날짜를 본문 헤더와 경고에 명시합니다. 캡처가 요청한 문서와 다르거나 캡처 자체가 차단 페이지면 폐기합니다. 아카이브에도 없는 문서(특히 `rev=` 과거판)는 현재판을 과거판인 것처럼 반환하지 않고 실패를 명시합니다.
 
 ### `perplexity_fetch_many`
 알려진 URL을 최대 5개까지 동시에 가져와 URL별 섹션으로 나눠 돌려줍니다.

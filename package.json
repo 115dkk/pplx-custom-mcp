@@ -1,6 +1,6 @@
 {
   "name": "perplexity-custom-mcp",
-  "version": "1.4.4",
+  "version": "1.5.0",
   "description": "Cloudflare Workers MCP server: Perplexity search plus a no-JS page fetcher",
   "type": "module",
   "main": "src/worker.js",

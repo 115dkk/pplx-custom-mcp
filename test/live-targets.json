@@ -36,7 +36,7 @@
       "name": "namuwiki via blocked-site fallback",
       "url": "https://namu.wiki/w/나무위키",
       "min_body_chars": 3000,
-      "expect_source": ["direct", "wayback", "agent-fetch-url", "perplexity"],
+      "expect_source": ["direct", "namu-mirror", "wayback", "agent-fetch-url", "perplexity"],
       "must_contain": []
     },
     {
