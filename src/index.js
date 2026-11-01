@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ── Config ──────────────────────────────────────────────────────────
 
-const VERSION = "1.4.4";
+const VERSION = "1.5.0";
 const CHROME_MAJOR = 157;
 const DESKTOP_CHROME_UA = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36`;
 const IOS_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
@@ -1563,6 +1563,21 @@ function namuReadableDocumentUrl(url) {
   }
 }
 
+function namuMirrorUrl(url) {
+  try {
+    const original = new URL(url);
+    if (original.hostname !== "namu.wiki" && original.hostname !== "www.namu.wiki") return null;
+    if (original.searchParams.has("rev")) return null;
+    if (!/^\/(?:w|raw)\/(.+)$/.test(original.pathname)) return null;
+    const readableUrl = namuReadableDocumentUrl(original.toString());
+    const match = new URL(readableUrl).pathname.match(/^\/w\/(.+)$/);
+    if (!match) return null;
+    return `https://www.namu.moe/w/${match[1]}`;
+  } catch {
+    return null;
+  }
+}
+
 // Historical revisions are unusually fragile: namu.wiki blocks /raw/?rev=
 // outright and may also reject /w/?rev= from a mediated fetcher.  The English
 // NamuWiki frontend exposes the same revision identity. Keep both identities
@@ -2883,6 +2898,103 @@ function extractNamuWikiData(url, html, mode = "balanced", opts = {}) {
       title,
     }),
   };
+}
+
+function namuMirrorArticleHtml(html) {
+  const articleMatch = String(html || "").match(/<article\b[^>]*>([\s\S]*?)<\/article\s*>/i);
+  if (!articleMatch) return "";
+  let articleHtml = articleMatch[1];
+  // Category/license are observed inside article on some mirror pages despite
+  // being outside the document body semantically. Stop before either region.
+  const trailer = articleHtml.search(/<(?:div|footer)\b[^>]*class\s*=\s*["'][^"']*\b(?:category|license)\b/i);
+  if (trailer >= 0) articleHtml = articleHtml.slice(0, trailer);
+  articleHtml = stripBoilerplateElements(articleHtml, { attrPattern: /(?:^|\s)toc(?:\s|$)/i });
+
+  const escapeHtml = (value) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return articleHtml.replace(/<pre\b([^>]*)>\s*<code\b([^>]*)>([\s\S]*?)<\/code>\s*<\/pre>/gi, (block, preAttrs, codeAttrs, encoded) => {
+    const decoded = decodeEntities(stripHtmlTagsQuoteAware(encoded)).replace(/\r\n?/g, "\n").trim();
+    if (/^#!if\b/i.test(decoded)) return "";
+    // A directive block that still carries template logic is the body of an
+    // unexpanded template (its parameters are already lost), not content.
+    if (/^#!/.test(decoded) && /\{\{\{#!if\b|^\s*#!if\b|^\s*##/im.test(decoded)) return "";
+    if (/^#!syntax\b/i.test(decoded)) {
+      const code = decoded.replace(/^#!syntax\b[^\n]*(?:\n|$)/i, "");
+      return code ? `<pre${preAttrs}><code${codeAttrs}>${escapeHtml(code)}</code></pre>` : "";
+    }
+    if (/^#!(?:wiki|folding|html)\b/i.test(decoded)) {
+      // Wiki/folding boxes hold ordinary prose and tables. Emit them as text so
+      // the residue cleanup below applies, instead of shielding them as code.
+      const retained = decoded.replace(/^#!(?:wiki|folding|html)\b[^\n]*(?:\n|$)/i, "").trim();
+      return retained ? `<div>${escapeHtml(retained).replace(/\n/g, "<br>")}</div>` : "";
+    }
+    // Any other directive (#!style CSS and the like) is presentation, not text.
+    if (/^#!/.test(decoded)) return "";
+    return block;
+  });
+}
+
+function cleanNamuMirrorResidue(text) {
+  let out = String(text || "").replace(/\r\n?/g, "\n");
+  // HTML residue is handled before the generic wiki openers so its payload can
+  // survive while any tags inside it are removed.
+  out = out.replace(/\{\{\{#!html\s+([\s\S]*?)\}\}\}/gi, (_, value) => stripHtmlTagsQuoteAware(value));
+  out = out
+    .replace(/\{\{\{#!(?:wiki|folding)\b[^\n]*?\b(?:dark-)?style\s*=\s*(["'])(?:(?!\1)[^\n])*?\1[ \t]*/gi, "")
+    .replace(/\{\{\{#!(?:wiki|folding|if)\b[^\n]*(?:\n|$)/gi, "")
+    .replace(/\{\{\{#!syntax[ \t]+\S+[ \t]?/gi, "")
+    // Text colour ({{{#red text}}}, {{{#fff,#000 text}}}) and size ({{{+1 text}}}) markup keep their text.
+    .replace(/\{\{\{#(?:[0-9a-f]{3,8}|[a-z]+)(?:,\s*#(?:[0-9a-f]{3,8}|[a-z]+))?[ \t]/gi, "")
+    .replace(/\{\{\{[+-][1-5][ \t]/g, "")
+    .replace(/\}\}\}+/g, "")
+    // NamuMark table cell/row/table attributes the mirror left unrendered.
+    .replace(/<(?:(?:table\s?|row|col)?(?:bg)?color|(?:table\s?)?(?:width|height|align|bordercolor|class))=[^<>\n]*>/gi, "")
+    .replace(/<(?:nopad|-\d+|[|^v]?\|\d+|[:()])>/gi, "")
+    .replace(/\[br\]/gi, "\n")
+    .replace(/\[\[([^|\]\n]+)\|([^\]\n]*)\]\]/g, "$2")
+    .replace(/\[\[([^\]\n]+)\]\]/g, "$1")
+    .replace(/'''([^'\n]+)'''/g, "$1")
+    .replace(/''([^'\n]+)''/g, "$1")
+    .split("\n")
+    .filter((line) => !/^\s*#!if\b/i.test(line))
+    .join("\n");
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function extractNamuMirrorData(html, originalUrl, mode = "balanced", opts = {}) {
+  if (!namuMirrorUrl(originalUrl)) return null;
+  const source = String(html || "");
+  const titleElement = findElementByClass(source, "wikiTitle");
+  const title = titleElement
+    ? htmlToText(titleElement, "raw-ish", { include_links: false }).replace(/\s+/g, " ").trim()
+    : "";
+  const modifiedElement = findElementByClass(source, "last-modified");
+  const modifiedText = modifiedElement ? htmlToText(modifiedElement, "raw-ish", { include_links: false }) : "";
+  const lastModified = modifiedText.match(/\b(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\b/)?.[1] || "";
+  const articleHtml = namuMirrorArticleHtml(source);
+  const missing = source.includes("해당 문서를 찾을 수 없습니다.") || !articleHtml;
+  if (missing) return { text: "", title, lastModified, missing: true };
+
+  const codeBlocks = [];
+  const protectedArticleHtml = articleHtml.replace(
+    /<pre\b[^>]*>\s*<code\b[^>]*>([\s\S]*?)<\/code>\s*<\/pre>/gi,
+    (_, encoded) => {
+      const token = `NAMU_MIRROR_CODE_BLOCK_${codeBlocks.length}_TOKEN`;
+      codeBlocks.push(decodeEntities(stripHtmlTagsQuoteAware(encoded)).replace(/\r\n?/g, "\n"));
+      return `<p>${token}</p>`;
+    },
+  );
+  let body = htmlToText(protectedArticleHtml, mode, {
+    include_links: opts.include_links !== false,
+    base_url: originalUrl,
+  });
+  body = cleanNamuMirrorResidue(body).replace(/\n{3,}/g, "\n\n");
+  body = body.replace(/NAMU_MIRROR_CODE_BLOCK_(\d+)_TOKEN/g, (_, index) => codeBlocks[Number(index)] || "").trim();
+  // Do not run cleanNamuWikiText here: it flattens every non-empty line into
+  // paragraph spacing, which needlessly damages genuine <pre><code> blocks.
+  const text = [title ? `# ${title}` : "", lastModified ? `최근 수정 시각: ${lastModified} (KST)` : "", body]
+    .filter(Boolean)
+    .join("\n\n");
+  return { text, title, lastModified, missing: false };
 }
 
 const MEDIAWIKI_BOILERPLATE_ATTR_RE = /(?:^|[\s_-])(mw-editsection|toc|catlinks|printfooter|navbox|metadata|ambox|headAlert|noprint|thumb|tright|tleft|floatright|floatleft|gallery)(?:$|[\s_-])/i;
@@ -4474,13 +4586,160 @@ async function fetchRemoteBody(url, maxChars, apiKey, warnings, deadline) {
 
 // ── Wayback Machine snapshot fallback ───────────────────────────────
 // namu.wiki's WAF refuses Cloudflare Workers egress and Perplexity's fetch_url
-// alike, but the Internet Archive keeps recent captures of the server-rendered
-// pages and web.archive.org itself stays reachable from a Worker. A capture is
-// stale by definition, so this path never replaces a successful direct or
-// remote fetch — it only stands in where the alternative is a search snippet
-// or nothing. The `id_` timestamp flag returns the original markup without the
-// Wayback toolbar or rewritten links, so the site extractor sees exactly what
-// the origin served and relative links resolve against the original host.
+// alike. Try the live read-only namu.moe mirror before falling back to the
+// Internet Archive's older server-rendered captures.
+const NAMU_MIRROR_TIMEOUT_MS = 10_000;
+
+function normalizedNamuTitle(value) {
+  return String(value || "").normalize("NFC").replace(/_/g, " ").trim();
+}
+
+function namuTitleFromUrl(url, maxDecodePasses = 1) {
+  try {
+    const pathname = new URL(url).pathname;
+    let title = pathname.replace(/^\/w\//i, "");
+    // namu.moe redirect Locations may percent-encode an already encoded title.
+    // Decode the requested title once, and only allow a second pass for the
+    // observed mirror redirect form.
+    for (let pass = 0; pass < maxDecodePasses; pass++) {
+      let decoded;
+      try {
+        decoded = decodeURIComponent(title);
+      } catch {
+        break;
+      }
+      if (decoded === title) break;
+      title = decoded;
+    }
+    return title;
+  } catch {
+    return "";
+  }
+}
+
+async function tryNamuMirror(url, opts, warnings, attemptTotal, deadline) {
+  const stageStart = Date.now();
+  const mirrorUrl = namuMirrorUrl(url);
+  if (!mirrorUrl) return null;
+  if (deadline && deadline.remaining() < 4_000) {
+    warnings.push("시간 예산 부족으로 나무위키 실시간 미러 조회 생략");
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "skipped: budget");
+    return null;
+  }
+  if (!isSafeFetchUrl(mirrorUrl)) {
+    warnings.push("나무위키 실시간 미러 URL이 안전하지 않아 사용하지 않음");
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "unsafe mirror URL");
+    return null;
+  }
+
+  let page;
+  const controller = new AbortController();
+  const timeout = deadline ? Math.min(NAMU_MIRROR_TIMEOUT_MS, deadline.remaining()) : NAMU_MIRROR_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    page = await fetchOnce(mirrorUrl, USER_AGENTS[1], controller.signal, new Map(), "auto");
+  } catch (err) {
+    const note = err?.name === "AbortError" ? "timeout" : String(err).slice(0, 120);
+    warnings.push(`나무위키 실시간 미러 fetch 실패: ${note}`);
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, note);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!(page.status >= 200 && page.status < 300) || !page.body) {
+    warnings.push(page.status === 404
+      ? "나무위키 실시간 미러: 문서를 찾을 수 없음 (HTTP 404)"
+      : `나무위키 실시간 미러 응답 이상: HTTP ${page.status}`);
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, `HTTP ${page.status}`);
+    return null;
+  }
+  if (looksBlocked(page.status, page.body, page.finalUrl || mirrorUrl)) {
+    warnings.push("나무위키 실시간 미러가 차단 페이지라 사용하지 않음");
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "blocked mirror");
+    return null;
+  }
+
+  const readableUrl = namuReadableDocumentUrl(url);
+  const extracted = extractNamuMirrorData(page.body, readableUrl, opts.cleaning_mode, opts);
+  if (!extracted || extracted.missing) {
+    warnings.push("나무위키 실시간 미러: 문서를 찾을 수 없음");
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "missing document");
+    return null;
+  }
+  const bodyOnly = extracted.text
+    .replace(/^# .*?(?:\n\n|$)/, "")
+    .replace(/^최근 수정 시각: .*?(?:\n\n|$)/, "")
+    .trim();
+  if (bodyOnly.length < 200) {
+    warnings.push("나무위키 실시간 미러: 본문이 비어 있어 사용하지 않음");
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "empty body");
+    return null;
+  }
+
+  const requestedTitle = namuTitleFromUrl(readableUrl);
+  const finalUrl = page.finalUrl || mirrorUrl;
+  let redirectedFrom = "";
+  let targetTitle = "";
+  try {
+    const final = new URL(finalUrl);
+    if (final.hostname !== "namu.moe" && final.hostname !== "www.namu.moe") {
+      warnings.push("나무위키 실시간 미러: 다른 호스트로 이동해 사용하지 않음");
+      recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "redirected off mirror");
+      return null;
+    }
+    redirectedFrom = final.searchParams.get("from") || "";
+    targetTitle = namuTitleFromUrl(finalUrl, 2);
+  } catch { /* final URL came from the validated fetch path */ }
+  const isRedirect = !!redirectedFrom;
+  const expectedTitle = isRedirect ? targetTitle : requestedTitle;
+  if (!expectedTitle || normalizedNamuTitle(extracted.title) !== normalizedNamuTitle(expectedTitle)) {
+    warnings.push(`나무위키 실시간 미러: 요청 문서와 제목이 달라 사용하지 않음 (${requestedTitle} / ${extracted.title})`);
+    recordDeadlineStage(deadline, "namu-mirror", stageStart, false, "title mismatch");
+    return null;
+  }
+  if (isRedirect) warnings.push(`나무위키 넘겨주기: ${requestedTitle} → ${targetTitle}`);
+
+  const lastModified = extracted.lastModified || "알 수 없음";
+  const header = `[나무위키가 직접 접근을 차단 → 실시간 미러 namu.moe 본문 사용 (무료, 문서 최근 수정 시각 ${lastModified}). 미러가 렌더링하지 못한 틀 일부는 생략됨]`;
+  warnings.push(`나무위키 직접 fetch가 차단되어 제3자 미러(namu.moe)로 대체: ${mirrorUrl}. 원문과 다를 수 있으니 중요한 내용은 namu.wiki 원문 링크로 확인하세요.`);
+  recordDeadlineStage(deadline, "namu-mirror", stageStart, true);
+  const meta = {
+    ...extractMetadata(page.body),
+    title: extracted.title,
+    site: "나무위키 (미러: namu.moe)",
+    siteName: "나무위키 (미러: namu.moe)",
+    modified: extracted.lastModified,
+  };
+  return {
+    ok: true,
+    // Not capped at FETCH_MAX_CHARS_LIMIT: like a direct fetch, the whole
+    // current article is available through `page`, and long NamuWiki articles
+    // routinely exceed one page.
+    text: `${header}\n\n${extracted.text}`,
+    html: page.body,
+    status: page.status,
+    attempt: attemptTotal + 1,
+    warnings,
+    partial: false,
+    source: "namu-mirror",
+    meta,
+    finalUrl,
+    contentType: page.contentType,
+    contentLength: page.contentLength,
+    structured: {
+      type: "namu_wiki_article",
+      title: extracted.title,
+      mirror_url: finalUrl,
+      last_modified: extracted.lastModified,
+    },
+  };
+}
+
+// The Internet Archive keeps recent captures of server-rendered pages and
+// web.archive.org itself stays reachable from a Worker. A capture is stale by
+// definition, so it only stands in where current retrieval returned nothing.
+// The `id_` timestamp flag returns original markup without the Wayback toolbar.
 const WAYBACK_AVAILABILITY_TIMEOUT_MS = 8_000;
 const WAYBACK_SNAPSHOT_TIMEOUT_MS = 12_000;
 
@@ -4669,6 +4928,8 @@ async function resolveExhaustedFetch({ url, apiKey, opts, warnings, attemptTotal
   };
   const waybackFirst = isNamuWikiUrl(url);
   if (waybackFirst) {
+    const mirrored = await tryNamuMirror(url, opts, warnings, attemptTotal, deadline);
+    if (mirrored) return mirrored;
     const archived = await tryWayback();
     if (archived) return archived;
   }
@@ -5856,7 +6117,7 @@ const SEARCH_DESCRIPTION = [
 
 const FETCH_DESCRIPTION = [
   "Fetch one URL, clean the page text, and return a paginated body with citation-ready metadata.",
-  "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
+  "The fetch path tries direct HTTP with UA rotation, simple same-origin form submission for button-only checks, Steam Store adult age gates, client-side meta/JS redirects, metadata fallback, document detection, optional Perplexity domain fallback, a free live NamuWiki mirror tried before the archive for blocked current NamuWiki documents (namu.moe; source: namu-mirror; the document's last-modified time is stated in the body header), a free Wayback Machine snapshot fallback for bot-blocked pages (source: wayback; the capture date is stated in the body header), and short Worker Cache reuse.",
   "Use metadata_only for triage; debug for redirects/status/content-type/cache diagnostics; cleaning_mode for strict/balanced/raw-ish text cleanup; include_links=false only when link URLs would add noise; site_preset for known sites such as steam/reddit/dcinside/namu/mediawiki/sage/sourceforge/youtube/github/news.",
   "Hacker News items and Stack Exchange questions are read through their official APIs (source: hn-algolia / stackexchange-api, or stackexchange-feed when the keyless API quota is spent); blocked Reddit posts come from the Arctic Shift archive (source: reddit-archive, scores and comments as of capture); YouTube watch pages include the video description.",
   "For DCinside posts the comment thread is XHR-loaded and would otherwise be missing; it is fetched via the comment API and appended under '## 댓글' by default (set include_comments=false to skip). Content images are attached automatically for DCinside (default max 2); for other sites set include_images=true when visual content matters. Successful images are returned both as MCP image blocks and as source URL metadata.",
@@ -6293,6 +6554,7 @@ export {
   isRedditUrl,
   isNamuWikiUrl,
   namuReadableDocumentUrl,
+  namuMirrorUrl,
   namuRemoteDocumentUrls,
   isMediaWikiUrl,
   isSageUrl,
@@ -6321,6 +6583,7 @@ export {
   extractYouTubeVideoData,
   extractBalancedJson,
   extractNamuWikiData,
+  extractNamuMirrorData,
   cleanNamuWikiText,
   extractMediaWikiArticleData,
   cleanMediaWikiText,
